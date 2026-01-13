@@ -236,7 +236,7 @@ def process(start_year, end_year, min_obs):
 @cli.command()
 @click.option(
     "--phase",
-    type=click.Choice(["phase1", "panel", "phase2", "phase3"]),
+    type=click.Choice(["phase1", "panel", "phase2", "phase3", "cash_substitution"]),
     default="phase1",
     help="Analysis phase to run",
 )
@@ -432,6 +432,115 @@ def analyze(phase, year):
         except Exception as e:
             click.echo(f"Time series analysis error: {e}", err=True)
             logger.exception("Time series analysis failed")
+            raise click.Abort()
+
+    elif phase == "cash_substitution":
+        try:
+            from btc_analysis.analysis.cash_substitution import run_cash_substitution_analysis
+
+            click.echo("\nRunning cash substitution analysis...")
+            click.echo("Testing exit liquidity hypothesis")
+            click.echo("-" * 50)
+
+            results = run_cash_substitution_analysis()
+
+            if not results:
+                click.echo("Analysis returned no results. Check data availability.", err=True)
+                return
+
+            # Display key results
+            click.echo("\n" + "=" * 60)
+            click.echo("CASH SUBSTITUTION ANALYSIS RESULTS")
+            click.echo("=" * 60)
+
+            # Data summary
+            if "data_summary" in results:
+                summary = results["data_summary"]
+                click.echo(f"\nData: {summary.get('n_observations', 'N/A')} observations")
+                click.echo(f"Period: {summary.get('date_range', 'N/A')}")
+
+            # Regime analysis
+            if "regime_analysis" in results:
+                regime = results["regime_analysis"]
+                click.echo("\nREGIME ANALYSIS:")
+                click.echo("-" * 40)
+
+                if "ratio_trend" in regime:
+                    trend = regime["ratio_trend"]
+                    click.echo(f"Cash/Drug ratio trend: {trend.get('monthly_pct_change', 0):.2f}% per month")
+                    click.echo(f"  Declining: {trend.get('is_declining', False)}")
+
+                for key in ["pre_institutional_residual_correlation",
+                           "post_institutional_residual_correlation"]:
+                    if key in regime:
+                        data = regime[key]
+                        sig = "***" if data["p_value"] < 0.01 else "**" if data["p_value"] < 0.05 else "*" if data["p_value"] < 0.1 else ""
+                        click.echo(f"  {data['label']}: r = {data['correlation']:.4f} "
+                                  f"(p={data['p_value']:.4f}) {sig}")
+
+            # Volume interaction (key finding)
+            if "volume_interaction" in results:
+                vi = results["volume_interaction"]
+                click.echo("\nVOLUME INTERACTION (Exit Liquidity):")
+                click.echo("-" * 40)
+
+                for key in ["correlation_low_volume", "correlation_high_volume"]:
+                    if key in vi:
+                        data = vi[key]
+                        sig = "***" if data["p_value"] < 0.01 else "**" if data["p_value"] < 0.05 else "*" if data["p_value"] < 0.1 else ""
+                        click.echo(f"  {data['label']}: r = {data['correlation']:.4f} "
+                                  f"(p={data['p_value']:.4f}) {sig}")
+
+                if "interaction_model" in vi:
+                    model = vi["interaction_model"]
+                    interact_coef = model["coefficients"].get("subst_x_volume", {})
+                    click.echo(f"\n  Interaction coefficient: {interact_coef.get('coefficient', 0):.4f} "
+                              f"(p={interact_coef.get('p_value', 1):.4f})")
+
+                if "economic_significance" in vi:
+                    click.echo(f"\n  {vi['economic_significance']['interpretation']}")
+
+            # Stress tests
+            if "stress_tests" in results:
+                st = results["stress_tests"]
+                click.echo("\nSTRESS TESTS:")
+                click.echo("-" * 40)
+
+                tests_passed = 0
+                tests_total = 0
+
+                if "bootstrap" in st:
+                    tests_total += 1
+                    passed = st["bootstrap"]["ci_excludes_zero"]
+                    tests_passed += int(passed)
+                    click.echo(f"  Bootstrap CI excludes zero: {'PASS' if passed else 'FAIL'}")
+
+                if "placebo_test" in st:
+                    tests_total += 1
+                    passed = st["placebo_test"]["passes"]
+                    tests_passed += int(passed)
+                    click.echo(f"  Placebo test (p < 0.05): {'PASS' if passed else 'FAIL'}")
+
+                if "leave_one_out" in st:
+                    tests_total += 1
+                    passed = st["leave_one_out"]["all_negative"]
+                    tests_passed += int(passed)
+                    click.echo(f"  Leave-one-out all negative: {'PASS' if passed else 'FAIL'}")
+
+                if "falsification_sp500" in st:
+                    tests_total += 1
+                    passed = st["falsification_sp500"]["passes"]
+                    tests_passed += int(passed)
+                    click.echo(f"  Falsification (S&P 500 not significant): {'PASS' if passed else 'FAIL'}")
+
+                click.echo(f"\n  Tests passed: {tests_passed}/{tests_total}")
+
+            output_dir = config.paths.outputs_dir / "cash_substitution"
+            click.echo(f"\nFull results saved to: {output_dir}")
+
+        except Exception as e:
+            click.echo(f"Cash substitution analysis error: {e}", err=True)
+            logger.exception("Cash substitution analysis failed")
             raise click.Abort()
 
 

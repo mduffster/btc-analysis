@@ -7,6 +7,7 @@ from .crime import fetch_organized_crime_index
 from .aml import create_fatf_panel, get_fatf_status
 from .cdc_overdose import fetch_overdose_deaths, get_national_monthly_overdose
 from .cbp_seizures import fetch_drug_seizures
+from .cbp_currency import fetch_currency_seizures
 from .btc_price import (
     fetch_btc_price,
     get_monthly_btc_price,
@@ -28,6 +29,7 @@ __all__ = [
     "fetch_overdose_deaths",
     "get_national_monthly_overdose",
     "fetch_drug_seizures",
+    "fetch_currency_seizures",
     "fetch_btc_price",
     "get_monthly_btc_price",
     "get_btc_halving_dates",
