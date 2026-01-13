@@ -478,10 +478,24 @@ def analyze(phase, year):
                         click.echo(f"  {data['label']}: r = {data['correlation']:.4f} "
                                   f"(p={data['p_value']:.4f}) {sig}")
 
-            # Volume interaction (key finding)
+            # Lagged models (PRIMARY CAUSAL FINDING)
+            if "lagged_models" in results:
+                lm = results["lagged_models"]
+                click.echo("\nLAGGED MODELS (Primary Causal Spec):")
+                click.echo("-" * 40)
+                for lag_key in ["lag_1", "lag_2", "lag_3"]:
+                    if lag_key in lm:
+                        lag_data = lm[lag_key]
+                        sig = "***" if lag_data.get("interaction_pvalue", 1) < 0.01 else "**" if lag_data.get("interaction_pvalue", 1) < 0.05 else "*" if lag_data.get("interaction_pvalue", 1) < 0.1 else ""
+                        click.echo(f"  {lag_key}: coef={lag_data.get('interaction_coef', 0):+.4f} "
+                                  f"(p={lag_data.get('interaction_pvalue', 1):.4f}) {sig}")
+                if "lag_1" in lm and lm["lag_1"].get("interaction_pvalue", 1) < 0.1:
+                    click.echo(f"\n  ** Lag-1 is significant: demand effect, not exit selling **")
+
+            # Volume interaction (contemporaneous - for comparison)
             if "volume_interaction" in results:
                 vi = results["volume_interaction"]
-                click.echo("\nVOLUME INTERACTION (Exit Liquidity):")
+                click.echo("\nCONTEMPORANEOUS (for comparison):")
                 click.echo("-" * 40)
 
                 for key in ["correlation_low_volume", "correlation_high_volume"]:

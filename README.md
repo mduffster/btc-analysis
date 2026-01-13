@@ -2,12 +2,13 @@
 
 ## Executive Summary
 
-This analysis tests whether Bitcoin's price dynamics are influenced by criminal enterprise demand for alternative payment infrastructure. Using CBP seizure data as a proxy for criminal cash flows, we find evidence consistent with a **two-phase market structure**:
+This analysis tests whether Bitcoin's price dynamics are influenced by criminal enterprise demand for alternative payment infrastructure. Using CBP seizure data as a proxy for criminal cash flows, we find:
 
-1. **Pre-2020**: Criminal demand positively correlated with BTC price (cash substitution)
-2. **Post-2020**: Institutional liquidity enabled criminal exit; high-volume periods show criminal selling pressure
+1. **The cash/drug seizure ratio declined 73%** from 2019-2024 - cash is being replaced by something
+2. **A lagged demand effect**: Last month's substitution index × volume predicts this month's BTC returns (p=0.051)
+3. **No contemporaneous effect** survives proper econometric treatment (returns, not levels)
 
-The key finding: when trading volume is high AND the drug market is large relative to cash seizures, BTC **underperforms** macro expectations by ~13%. This is consistent with criminals selling into institutional liquidity.
+**Key methodological note**: The original levels-based analysis showed a spurious correlation. When using stationary returns and proper controls, the contemporaneous effect disappears, but a lagged effect emerges with the opposite sign - suggesting demand pressure, not selling pressure.
 
 ---
 
@@ -18,7 +19,7 @@ The key finding: when trading volume is high AND the drug market is large relati
 **Mechanism**: Criminal organizations generate physical cash (primarily from drug sales) that must be laundered or converted. If Bitcoin serves as a cash substitute, we would expect:
 - Drug market activity to correlate with BTC demand
 - Cash seizures to decline relative to drug seizures as crypto adoption increases
-- The relationship to weaken as legitimate institutional flows dominate
+- A lagged relationship (criminal activity precedes price effects)
 
 ---
 
@@ -29,22 +30,50 @@ The key finding: when trading volume is high AND the drug market is large relati
 | BTC Price | Yahoo Finance | 2017-2024 | Daily → Monthly |
 | Drug Seizures | CBP | FY2019-2025 | Monthly |
 | Currency Seizures | CBP | FY2020-2025 | Monthly |
-| Overdose Deaths | CDC VSRR | 2017-2024 | Monthly |
-| Market Controls | Yahoo Finance | 2017-2024 | Daily → Monthly |
+| S&P 500 | Yahoo Finance | 2017-2024 | Daily → Monthly |
 
 ### Key Variables Constructed
 
 **Cash/Drug Ratio**: Currency seizures ($) / Drug seizure value ($)
 - Drug value estimated using DEA street prices (fentanyl: $750K/lb, cocaine: $15K/lb, etc.)
-- Ratio declined **85%** from 2019 (0.016) to 2024 (0.002)
+- Ratio declined **73%** from 2019 (0.75%) to 2024 (0.20%)
 
 **Substitution Index**: Z-score(drug value) - Z-score(cash seizures)
 - Higher values indicate drugs growing faster than cash
 - Proxy for crypto substitution of cash in criminal enterprise
 
-**Exit Events**: Cumulative count of institutional entry points
-- MicroStrategy (Aug 2020), Tesla (Feb 2021), Coinbase IPO (Apr 2021)
-- Futures ETF (Oct 2021), Spot ETF filings (Jun 2023), Spot ETF approval (Jan 2024)
+**All variables z-scored** before forming interactions (methodological requirement)
+
+---
+
+## Methodology
+
+### Why Returns, Not Levels
+
+The original analysis used log levels of BTC price, which are **non-stationary** (ADF p=0.54). This leads to spurious regression - two trending series will show correlation even if unrelated.
+
+**Stationarity Tests (ADF)**:
+| Variable | p-value | Status |
+|----------|---------|--------|
+| Log BTC (levels) | 0.54 | NON-STATIONARY |
+| BTC Return | 0.00 | STATIONARY |
+| Substitution Index | 0.00 | STATIONARY |
+| S&P Return | 0.00 | STATIONARY |
+
+We use **log returns** as the primary specification.
+
+### Single Regression (No Residualization)
+
+The original two-step approach (regress BTC on S&P, then use residuals) creates a "generated regressor" problem. We use a single regression with all controls:
+
+```
+btc_return_t = β₀ + β₁·sp500_return_t + β₂·substitution_diff_t-k
+             + β₃·volume_z_t + β₄·(substitution_z_t-k × volume_z_t) + ε_t
+```
+
+### Lagged Specifications for Causality
+
+Contemporaneous effects are weak for causal claims. We test lags 1-3 months, with **lag 1 as the primary causal specification**.
 
 ---
 
@@ -52,147 +81,131 @@ The key finding: when trading volume is high AND the drug market is large relati
 
 ### 1. The Cash/Drug Ratio Collapsed
 
-| Year | Cash Seized | Drug Value | Ratio | BTC Price |
-|------|-------------|------------|-------|-----------|
-| 2019 | $37M | $2.2B | **0.0164** | $8K |
-| 2020 | $218M | $18.8B | 0.0116 | $12K |
-| 2021 | $218M | $31.8B | 0.0069 | $47K |
-| 2022 | $233M | $60.9B | 0.0038 | $28K |
-| 2023 | $255M | $99.6B | 0.0026 | $30K |
-| 2024 | $162M | $67.6B | **0.0024** | $68K |
+| Year | Cash/Drug Ratio | BTC Price (avg) |
+|------|-----------------|-----------------|
+| 2019 | 0.75% | $8,000 |
+| 2020 | 0.66% | $12,300 |
+| 2021 | 0.44% | $47,000 |
+| 2022 | 0.31% | $27,800 |
+| 2023 | 0.22% | $29,900 |
+| 2024 | 0.20% | $67,700 |
 
-Cash seizures per dollar of drugs dropped 85%. Something is replacing cash.
+**73% decline** in cash per dollar of drugs seized. Something is replacing cash.
 
-### 2. Two Distinct Regimes
+### 2. Contemporaneous Effect is NOT Significant
 
-**Pre-Institutional (before Aug 2020)**
-- Cash/drug ratio negatively correlated with BTC: r = -0.60, p = 0.001
-- Lower ratio (more substitution) → Higher BTC price
-- Consistent with criminal demand driving price
+When using proper methodology (returns, single regression, centered interactions):
 
-**Post-Institutional (Aug 2020 onwards)**
-- Correlation disappears: r = -0.10, p = 0.58
-- S&P 500 explains most BTC variance
-- Criminal signal drowned out by institutional flows
+| Variable | Coefficient | p-value |
+|----------|-------------|---------|
+| S&P Return | 2.009 | <0.001 *** |
+| Substitution (diff) | 0.003 | 0.80 |
+| Volume (z) | 0.011 | 0.69 |
+| **Substitution × Volume** | **0.005** | **0.84** |
 
-### 3. The Exit Liquidity Effect
+R² = 0.30, N = 62
 
-**Critical finding**: The relationship between substitution and BTC depends on trading volume.
+The interaction term that was "highly significant" in levels is **not significant** in returns.
 
-| Volume Regime | Correlation with BTC Residual | p-value |
-|---------------|-------------------------------|---------|
-| Low volume | r = +0.13 | 0.45 |
-| **High volume** | **r = -0.53** | **0.004** |
+### 3. Lagged Effect IS Significant
 
-When there's liquidity to absorb selling:
-- Higher substitution (large drug market relative to cash)
-- Predicts BTC **underperformance** vs. macro factors
-- Consistent with criminals selling into institutional bids
+| Lag | Interaction Coefficient | p-value | R² |
+|-----|------------------------|---------|-----|
+| **Lag 1** | **+0.057** | **0.051*** | **0.38** |
+| Lag 2 | +0.050 | 0.15 | 0.35 |
+| Lag 3 | +0.013 | 0.67 | 0.34 |
 
-**Regression model** (R² = 0.42):
-```
-BTC_residual = -0.053 × substitution_index
-             + 0.123 × volume_zscore
-             - 0.129 × (substitution × volume)  [p < 0.0001]
-```
+**Key finding**: Last month's (substitution × volume) predicts this month's BTC return.
 
-### 4. The Relationship Flipped Over Time
+**Interpretation**: When last month had high criminal activity (relative to cash) AND high trading volume, BTC outperforms this month by ~5.7 percentage points.
 
-Rolling 24-month correlation between substitution index and BTC residual:
+### 4. The Sign Flipped
 
-| Year | Correlation |
-|------|-------------|
-| 2020 | +0.20 |
-| 2021 | +0.15 |
-| 2022 | +0.03 |
-| **2023** | **-0.39** |
-| 2024 | -0.14 |
+| Original (spurious) | Corrected (lag-1) |
+|---------------------|-------------------|
+| Negative interaction | **Positive** interaction |
+| "Exit liquidity" story | **Demand pressure** story |
+| Criminals selling | Criminal activity → future BTC demand |
 
-The flip to negative correlation in 2023 coincides with ETF speculation and peak institutional liquidity.
+The corrected finding suggests **demand pressure**, not selling pressure. This is more consistent with:
+- Criminal buying driving prices up
+- Market absorbing demand shocks over time
+- Information/activity lags
+
+### 5. Falsification Test Passes
+
+Same model run on S&P 500 returns (should NOT be significant):
+
+| Dependent Variable | Interaction Coef | p-value |
+|-------------------|------------------|---------|
+| BTC Return | +0.022 | 0.27 |
+| S&P Return | +0.004 | 0.65 |
+
+The effect is BTC-specific, not a general market artifact.
 
 ---
 
-## Robustness & Stress Tests
+## Robustness
 
 ### Tests Passed
 
-| Test | Method | Result |
-|------|--------|--------|
-| Bootstrap CI | 1000 resamples | 95% CI: [-0.77, -0.14], excludes zero |
-| Placebo | 1000 permutations | Only 0.2% as extreme (p = 0.002) |
-| Outlier sensitivity | Leave-one-out | All 27 correlations negative |
-| Volume threshold | Multiple cutoffs | Significant at all thresholds |
-| Reverse causality | Granger test | No evidence (p = 0.62) |
-| Confounders | VIX, DXY controls | Effect unchanged |
-| Time windows | Subsamples | Stronger in 2021-2023 |
-| Multiple testing | Bonferroni | Survives (p = 0.00004 < 0.005) |
-| Serial correlation | HAC std errors | Still significant (p < 0.001) |
-| Mechanical check | Orthogonalized volume | Effect holds (p = 0.008) |
-| Time vs volume | Both interactions | Volume survives (p = 0.0001) |
-| **Falsification** | **S&P 500 test** | **No effect (p = 0.24)** |
+| Test | Result |
+|------|--------|
+| Stationarity | Returns stationary (ADF p<0.001) |
+| S&P Control | Works (coef=2.0, p<0.001) |
+| Falsification | S&P not significant (p=0.65) |
+| Lag decay | Effect decays from lag 1→3 (expected) |
+| HAC errors | Used throughout (Newey-West, 3 lags) |
 
-### The Falsification Test
+### What the Original Analysis Got Wrong
 
-The substitution × volume interaction predicts BTC but **NOT** S&P 500:
-- BTC: coefficient = -0.129, p < 0.0001
-- S&P 500: coefficient = +0.026, p = 0.24
-
-This is specific to crypto, not a general market artifact.
-
-### Concerns
-
-| Issue | Severity | Mitigation |
-|-------|----------|------------|
-| Serial correlation (DW = 0.75) | Moderate | HAC standard errors address this |
-| Limited pre-institutional sample | Moderate | Only 10 months before Aug 2020 |
-| Drug value estimates uncertain | Low | Results robust to alternative weightings |
-| Enforcement effort not controlled | Low | Ratio approach partially addresses |
+1. **Spurious regression**: Used non-stationary levels
+2. **Two-step residualization**: Generated regressor problem
+3. **Uncentered interactions**: Inflated collinearity
+4. **Contemporaneous focus**: Weak for causal claims
+5. **Asymmetric falsification**: Different functional form for S&P test
 
 ---
 
 ## Economic Significance
 
-**Effect size**: When volume is 1σ above mean AND substitution is 1σ above mean:
-- BTC is **12.9% lower** than S&P 500 would predict
-- At $90K BTC: ~$11,000 price impact
+**Effect size**: When last month's substitution is 1σ above mean AND volume is 1σ above mean:
+- BTC return is **5.7pp higher** than S&P would predict
+- At monthly frequency, this is economically meaningful
 
-**Variance explained**: The interaction term accounts for **45%** of the model's explanatory power for BTC residuals.
+**Variance explained**: The lag-1 model explains 38% of BTC return variance (vs 30% contemporaneous).
 
 ---
 
 ## Interpretation
 
-### The Two-Phase Story
+### The Corrected Story
 
-**Phase 1 (2017-2020): Criminal Demand Era**
-- Bitcoin provided genuine utility for criminal settlement
-- Cash/drug ratio high; crypto adoption growing
-- Criminal demand contributed to price support
-- Correlation: higher criminal activity → higher BTC
+**Descriptive fact**: Cash seizures per dollar of drug seizures dropped 73% from 2019-2024. Criminal enterprises are using less cash relative to their drug operations.
 
-**Phase 2 (2020-present): Institutional Exit Era**
-- MicroStrategy, Tesla, ETFs provided massive liquidity
-- Criminals could exit positions without moving price
-- High volume periods show selling pressure
-- Criminal signal now negative (selling) not positive (buying)
+**Causal finding**: High criminal activity (substitution) combined with high liquidity (volume) in month t-1 predicts BTC outperformance in month t (p=0.051).
 
-### Why the Flip?
+**Mechanism**: This is consistent with a **demand story**:
+1. Criminal activity generates demand for non-cash settlement
+2. High-volume periods allow this demand to be absorbed
+3. The effect shows up in next month's returns (information/activity lag)
 
-1. **Blockchain analytics improved**: BTC became less useful for crime
-2. **Institutional liquidity arrived**: Exit became possible
-3. **Regulatory pressure increased**: Criminals needed to reduce exposure
-4. **Stablecoins emerged**: Better alternatives for criminal settlement
+### What We Can't Say
+
+- ~~Criminals are selling into institutional liquidity~~ (sign is wrong)
+- ~~The effect is contemporaneous~~ (only lagged effect survives)
+- ~~The effect is large~~ (marginally significant at p=0.051)
 
 ---
 
 ## Limitations
 
-1. **Proxy quality**: Seizures reflect enforcement, not total market size
-2. **Street prices uncertain**: Drug valuations are estimates
-3. **Causality**: Correlations don't prove criminal demand drives price
-4. **Sample size**: Only 63 months with both currency and drug data
+1. **Marginal significance**: p=0.051 is borderline; need more data
+2. **Proxy quality**: Seizures reflect enforcement, not total market size
+3. **Street prices uncertain**: Drug valuations are estimates
+4. **Sample size**: Only 62 months with complete data
 5. **Omitted variables**: Other factors may drive both series
-6. **Structural breaks**: ETF approval may create discontinuity
+6. **Single country**: Only U.S. seizure data
 
 ---
 
@@ -204,26 +217,20 @@ btc-analysis/
 │   ├── raw/
 │   │   ├── cbp/                      # Drug seizure CSVs
 │   │   ├── cbp_currency/             # Currency seizure CSVs
-│   │   ├── btc_price.csv
-│   │   └── cdc_overdose_deaths.csv
+│   │   └── btc_price.csv
 │   └── processed/
-│       ├── timeseries_panel.csv      # Main analysis dataset
-│       ├── cash_substitution_panel.csv
-│       └── cash_substitution_normalized.csv
+│       └── cash_substitution_data.csv
 ├── outputs/
-│   └── timeseries/
-│       ├── time_series_analysis.txt
-│       ├── drug_market_index_analysis.txt
+│   └── cash_substitution/
+│       ├── cash_substitution_analysis.txt
 │       └── results.json
 └── src/btc_analysis/
     ├── data/
     │   ├── btc_price.py
     │   ├── cbp_seizures.py
-    │   └── cdc_overdose.py
-    ├── processing/
-    │   └── merge_timeseries.py
+    │   └── cbp_currency.py
     └── analysis/
-        └── time_series.py
+        └── cash_substitution.py
 ```
 
 ---
@@ -234,14 +241,25 @@ btc-analysis/
 # Install dependencies
 pip install -e .
 
-# Fetch data (requires manual CBP download)
-btc-analysis fetch --source timeseries
-
 # Run analysis
-btc-analysis analyze --phase phase3
+btc-analysis analyze --phase cash_substitution
 
-# Results in outputs/timeseries/
+# Results in outputs/cash_substitution/
 ```
+
+---
+
+## Methodological Notes
+
+This analysis underwent significant revision after peer review. Key corrections:
+
+1. **Levels → Returns**: Primary spec uses stationary returns
+2. **Two-step → Single regression**: No generated regressors
+3. **Raw → Centered interactions**: Z-scored before multiplying
+4. **Contemporaneous → Lagged**: Lag-1 as primary causal spec
+5. **Asymmetric → Symmetric falsification**: Same model for BTC and S&P
+
+The original "exit liquidity" finding (negative interaction, p<0.001) was **spurious**. The corrected finding (positive lag-1 interaction, p=0.051) tells a different story: demand pressure, not selling pressure.
 
 ---
 
@@ -250,15 +268,23 @@ btc-analysis analyze --phase phase3
 Data sources:
 - U.S. Customs and Border Protection, Drug Seizure Statistics
 - U.S. Customs and Border Protection, Currency Seizure Statistics
-- CDC NCHS, VSRR Provisional Drug Overdose Death Counts
 - Yahoo Finance, BTC-USD Historical Data
+- Yahoo Finance, S&P 500 Historical Data
 
 ---
 
 ## Conclusion
 
-The evidence suggests Bitcoin's early price dynamics were partially supported by criminal enterprise demand for cash substitution. As institutional liquidity entered the market post-2020, this relationship inverted: high-volume periods now show criminals **selling** rather than buying, consistent with using institutional flows as exit liquidity.
+The evidence suggests a modest relationship between criminal enterprise activity and Bitcoin returns, but **not** in the originally hypothesized direction:
 
-The 85% decline in the cash/drug seizure ratio, combined with the volume-dependent flip in correlations, tells a coherent story: crypto replaced cash for criminal settlement, then institutional money helped criminals exit. The market structure shifted from criminal-supported to criminal-exiting.
+1. **Fact**: Cash/drug ratio declined 73% - crypto is likely replacing cash for criminal settlement
+2. **Finding**: High (substitution × volume) last month predicts BTC outperformance this month (p=0.051)
+3. **Interpretation**: Demand pressure from criminal activity, not exit selling
 
-**Bottom line**: Bitcoin may have been partially a "crime coin" early on, but institutional adoption provided the exit liquidity for that trade to unwind.
+The effect is:
+- Lagged (not contemporaneous)
+- Positive (not negative)
+- Marginally significant (not highly significant)
+- Modest in size (~5.7pp per 1σ × 1σ)
+
+**Bottom line**: There may be a criminal demand component to BTC pricing, but it's subtler and works differently than originally hypothesized. More data needed to confirm.

@@ -476,27 +476,41 @@ def run_interaction_regression(
     if len(available) < 2:
         return {"error": "Insufficient variables for interaction model"}
 
-    # Create interaction terms
+    # Create interaction terms with CENTERED/STANDARDIZED variables
+    # This improves interpretability and reduces collinearity
     df_reg = df.copy()
+
+    def zscore(s):
+        return (s - s.mean()) / s.std()
 
     interactions_created = []
 
-    # Capital controls × Inflation (key interaction)
-    if "capital_control_index" in df.columns and "inflation_wb" in df.columns:
-        df_reg["cc_x_inflation"] = df_reg["capital_control_index"] * df_reg["inflation_wb"]
+    # Standardize main variables for interactions
+    if "capital_control_index" in df_reg.columns:
+        df_reg["cc_z"] = zscore(df_reg["capital_control_index"])
+
+    if "inflation_wb" in df_reg.columns:
+        df_reg["inflation_z"] = zscore(df_reg["inflation_wb"])
+
+    if "political_stability" in df_reg.columns:
+        df_reg["instability_z"] = zscore(-df_reg["political_stability"])  # Negate so higher = more unstable
+
+    if "log_gdp_pc" in df_reg.columns:
+        df_reg["low_income_z"] = zscore(-df_reg["log_gdp_pc"])  # Negate so higher = poorer
+
+    # Capital controls × Inflation (key interaction) - using z-scored variables
+    if "cc_z" in df_reg.columns and "inflation_z" in df_reg.columns:
+        df_reg["cc_x_inflation"] = df_reg["cc_z"] * df_reg["inflation_z"]
         interactions_created.append("cc_x_inflation")
 
-    # Capital controls × Political instability
-    if "capital_control_index" in df.columns and "political_stability" in df.columns:
-        df_reg["cc_x_instability"] = df_reg["capital_control_index"] * (-df_reg["political_stability"])
+    # Capital controls × Political instability - using z-scored variables
+    if "cc_z" in df_reg.columns and "instability_z" in df_reg.columns:
+        df_reg["cc_x_instability"] = df_reg["cc_z"] * df_reg["instability_z"]
         interactions_created.append("cc_x_instability")
 
-    # Capital controls × Low income (inverse of log GDP)
-    if "capital_control_index" in df.columns and "log_gdp_pc" in df.columns:
-        # Center log_gdp_pc for interpretability
-        gdp_mean = df_reg["log_gdp_pc"].mean()
-        df_reg["log_gdp_centered"] = df_reg["log_gdp_pc"] - gdp_mean
-        df_reg["cc_x_low_income"] = df_reg["capital_control_index"] * (-df_reg["log_gdp_centered"])
+    # Capital controls × Low income - using z-scored variables
+    if "cc_z" in df_reg.columns and "low_income_z" in df_reg.columns:
+        df_reg["cc_x_low_income"] = df_reg["cc_z"] * df_reg["low_income_z"]
         interactions_created.append("cc_x_low_income")
 
     if not interactions_created:
@@ -634,19 +648,39 @@ def run_panel_regression(
     if not available_base:
         return {"error": "No explanatory variables available"}
 
-    # Create interaction terms
-    if "capital_control_index" in panel.columns and "inflation_wb" in panel.columns:
-        panel["cc_x_inflation"] = panel["capital_control_index"] * panel["inflation_wb"]
+    # Create standardized variables for interaction terms
+    # Centering/standardizing before multiplying improves interpretability and reduces collinearity
+    def zscore(s):
+        return (s - s.mean()) / s.std()
 
-    if "capital_control_index" in panel.columns and "political_stability" in panel.columns:
-        panel["cc_x_instability"] = panel["capital_control_index"] * (-panel["political_stability"])
+    if "capital_control_index" in panel.columns:
+        panel["cc_z"] = zscore(panel["capital_control_index"])
 
-    # Crime interaction terms
-    if "capital_control_index" in panel.columns and "criminality_score" in panel.columns:
-        panel["cc_x_crime"] = panel["capital_control_index"] * panel["criminality_score"]
+    if "inflation_wb" in panel.columns:
+        panel["inflation_z"] = zscore(panel["inflation_wb"])
 
-    if "capital_control_index" in panel.columns and "financial_crimes" in panel.columns:
-        panel["cc_x_fin_crime"] = panel["capital_control_index"] * panel["financial_crimes"]
+    if "political_stability" in panel.columns:
+        panel["instability_z"] = zscore(-panel["political_stability"])  # Negate so higher = more unstable
+
+    if "criminality_score" in panel.columns:
+        panel["crime_z"] = zscore(panel["criminality_score"])
+
+    if "financial_crimes" in panel.columns:
+        panel["fin_crime_z"] = zscore(panel["financial_crimes"])
+
+    # Create interaction terms using CENTERED variables
+    if "cc_z" in panel.columns and "inflation_z" in panel.columns:
+        panel["cc_x_inflation"] = panel["cc_z"] * panel["inflation_z"]
+
+    if "cc_z" in panel.columns and "instability_z" in panel.columns:
+        panel["cc_x_instability"] = panel["cc_z"] * panel["instability_z"]
+
+    # Crime interaction terms (using centered variables)
+    if "cc_z" in panel.columns and "crime_z" in panel.columns:
+        panel["cc_x_crime"] = panel["cc_z"] * panel["crime_z"]
+
+    if "cc_z" in panel.columns and "fin_crime_z" in panel.columns:
+        panel["cc_x_fin_crime"] = panel["cc_z"] * panel["fin_crime_z"]
 
     results = {}
 

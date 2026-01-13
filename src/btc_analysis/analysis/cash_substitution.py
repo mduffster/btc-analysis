@@ -3,22 +3,23 @@
 Tests the hypothesis that Bitcoin serves as a cash substitute for criminal
 enterprise, and that institutional liquidity enabled criminal exit.
 
-Key findings:
-1. Cash/drug seizure ratio declined 85% from 2019-2024
-2. Pre-2020: Criminal demand positively correlated with BTC
-3. Post-2020: High-volume periods show criminal selling pressure
-4. The substitution x volume interaction is highly significant
+Methodological notes:
+- Primary spec uses log returns (stationary), levels models are descriptive only
+- Single regression with controls (no two-step residualization)
+- Variables centered/standardized before forming interactions
+- Lagged specifications (1-3 months) for causal inference
+- Symmetric falsification test using same functional form
 """
 
 import logging
 from pathlib import Path
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List
 
 import numpy as np
 import pandas as pd
 import statsmodels.api as sm
 from scipy import stats
-from statsmodels.tsa.stattools import grangercausalitytests
+from statsmodels.tsa.stattools import grangercausalitytests, adfuller
 from statsmodels.stats.stattools import durbin_watson
 
 from btc_analysis.config import get_config
@@ -61,9 +62,10 @@ def run_cash_substitution_analysis(
 
     Tests:
     1. Cash/drug ratio trend over time
-    2. Correlation with BTC by regime (pre/post institutional)
-    3. Volume interaction (exit liquidity hypothesis)
-    4. Stress tests and robustness checks
+    2. Returns-based regression (PRIMARY - stationary)
+    3. Lagged specifications for causal inference
+    4. Volume interaction with centered variables
+    5. Stress tests and falsification
 
     Args:
         output_dir: Directory to save outputs.
@@ -94,26 +96,38 @@ def run_cash_substitution_analysis(
         "date_range": f"{df['date'].min().strftime('%Y-%m')} to {df['date'].max().strftime('%Y-%m')}",
     }
 
-    # Step 2: Calculate cash substitution metrics
-    logger.info("Calculating cash substitution metrics...")
-    df = _calculate_substitution_metrics(df)
+    # Step 2: Calculate metrics with proper transformations
+    logger.info("Calculating metrics...")
+    df = _calculate_metrics(df)
 
-    # Step 3: Regime analysis
-    logger.info("Running regime analysis...")
+    # Step 3: Stationarity tests
+    logger.info("Running stationarity tests...")
+    results["stationarity"] = _run_stationarity_tests(df)
+
+    # Step 4: Descriptive regime analysis (levels - for context only)
+    logger.info("Running descriptive regime analysis...")
     results["regime_analysis"] = _run_regime_analysis(df)
 
-    # Step 4: Volume interaction analysis
+    # Step 5: PRIMARY SPEC - Returns-based single regression
+    logger.info("Running primary returns-based analysis...")
+    results["primary_returns_model"] = _run_returns_regression(df)
+
+    # Step 6: Lagged specifications for causal inference
+    logger.info("Running lagged specifications...")
+    results["lagged_models"] = _run_lagged_regressions(df)
+
+    # Step 7: Volume interaction with centered variables
     logger.info("Running volume interaction analysis...")
     results["volume_interaction"] = _run_volume_interaction_analysis(df)
 
-    # Step 5: Stress tests
+    # Step 8: Stress tests with symmetric falsification
     logger.info("Running stress tests...")
     results["stress_tests"] = _run_stress_tests(df)
 
-    # Step 6: Save results
+    # Step 9: Save results
     _save_results(results, df, output_dir)
 
-    # Step 7: Generate report
+    # Step 10: Generate report
     report = _generate_report(results)
     report_path = output_dir / "cash_substitution_analysis.txt"
     with open(report_path, "w") as f:
@@ -126,8 +140,6 @@ def run_cash_substitution_analysis(
 
 def _load_and_merge_data(start_year: int, end_year: int) -> pd.DataFrame:
     """Load and merge currency seizures, drug seizures, and BTC price."""
-    config = get_config()
-
     # Load currency seizures
     currency = fetch_currency_seizures(start_year=start_year, end_year=end_year)
     if currency.empty:
@@ -150,6 +162,7 @@ def _load_and_merge_data(start_year: int, end_year: int) -> pd.DataFrame:
         return pd.DataFrame()
 
     # Aggregate BTC to monthly
+    btc = btc.copy()
     btc["date"] = pd.to_datetime(btc["date"])
     btc["year"] = btc["date"].dt.year
     btc["month"] = btc["date"].dt.month
@@ -157,7 +170,7 @@ def _load_and_merge_data(start_year: int, end_year: int) -> pd.DataFrame:
         "price": "last",
         "volume": "sum",
     }).reset_index()
-    btc_monthly.columns = ["year", "month", "btc_price_close", "btc_volume"]
+    btc_monthly.columns = ["year", "month", "btc_price", "btc_volume"]
     btc_monthly["date"] = pd.to_datetime(
         btc_monthly["year"].astype(str) + "-" +
         btc_monthly["month"].astype(str).str.zfill(2) + "-01"
@@ -167,16 +180,20 @@ def _load_and_merge_data(start_year: int, end_year: int) -> pd.DataFrame:
     df = pd.merge(currency, drugs, on=["date", "year", "month"], how="inner")
     df = pd.merge(df, btc_monthly, on=["date", "year", "month"], how="inner")
 
-    # Load market controls
+    # Load S&P 500 for macro control
     try:
         import yfinance as yf
-        sp500_data = yf.download("^GSPC", start=f"{start_year}-01-01", end=f"{end_year+1}-01-01",
-                           progress=False)
+        sp500_data = yf.download(
+            "^GSPC",
+            start=f"{start_year}-01-01",
+            end=f"{end_year+1}-01-01",
+            progress=False
+        )
         # Handle MultiIndex columns from newer yfinance
         if isinstance(sp500_data.columns, pd.MultiIndex):
             sp500_data.columns = [col[0] for col in sp500_data.columns]
         sp500 = sp500_data["Close"].resample("ME").last()
-        sp500_df = pd.DataFrame({"date": sp500.index, "sp500_close": sp500.values})
+        sp500_df = pd.DataFrame({"date": sp500.index, "sp500_price": sp500.values})
         sp500_df["date"] = sp500_df["date"].dt.to_period("M").dt.to_timestamp()
         df = pd.merge(df, sp500_df, on="date", how="left")
     except Exception as e:
@@ -186,38 +203,53 @@ def _load_and_merge_data(start_year: int, end_year: int) -> pd.DataFrame:
     return df
 
 
-def _calculate_substitution_metrics(df: pd.DataFrame) -> pd.DataFrame:
-    """Calculate cash substitution metrics."""
+def _calculate_metrics(df: pd.DataFrame) -> pd.DataFrame:
+    """Calculate all metrics with proper transformations."""
     df = df.copy()
 
     # Calculate drug value using street prices
     drug_cols = [c for c in df.columns if c.endswith("_lbs")]
     df["drug_value_usd"] = 0
     for col in drug_cols:
-        drug_name = col
-        value_per_lb = STREET_VALUE_PER_LB.get(drug_name, 5000)
+        value_per_lb = STREET_VALUE_PER_LB.get(col, 5000)
         df["drug_value_usd"] += df[col].fillna(0) * value_per_lb
 
     # Cash/drug ratio
     df["cash_drug_ratio"] = df["currency_seizure_usd"] / df["drug_value_usd"]
     df["cash_drug_ratio"] = df["cash_drug_ratio"].replace([np.inf, -np.inf], np.nan)
 
-    # Z-score normalized components
-    df["cash_zscore"] = (df["currency_seizure_usd"] - df["currency_seizure_usd"].mean()) / df["currency_seizure_usd"].std()
-    df["drug_zscore"] = (df["drug_value_usd"] - df["drug_value_usd"].mean()) / df["drug_value_usd"].std()
-
-    # Substitution index: drug growth relative to cash
-    df["substitution_index"] = df["drug_zscore"] - df["cash_zscore"]
-
-    # Log transforms
-    df["log_btc"] = np.log(df["btc_price_close"])
+    # Log transforms (for levels analysis - descriptive only)
+    df["log_btc"] = np.log(df["btc_price"])
     df["log_ratio"] = np.log(df["cash_drug_ratio"].replace(0, np.nan))
-    df["btc_return"] = df["btc_price_close"].pct_change()
+    if "sp500_price" in df.columns:
+        df["log_sp500"] = np.log(df["sp500_price"])
 
-    # Volume z-score
+    # RETURNS (PRIMARY - stationary)
+    df = df.sort_values("date").reset_index(drop=True)
+    df["btc_return"] = df["log_btc"].diff()
+    if "log_sp500" in df.columns:
+        df["sp500_return"] = df["log_sp500"].diff()
+
+    # Substitution index components - Z-scored for interpretability
+    df["cash_z"] = _zscore(df["currency_seizure_usd"])
+    df["drug_z"] = _zscore(df["drug_value_usd"])
+    df["substitution_index"] = df["drug_z"] - df["cash_z"]
+
+    # Z-score the substitution index itself for interaction terms
+    df["substitution_z"] = _zscore(df["substitution_index"])
+
+    # First difference of substitution (for returns regression)
+    df["substitution_diff"] = df["substitution_index"].diff()
+
+    # Volume - Z-scored
     if "btc_volume" in df.columns:
-        df["volume_zscore"] = (df["btc_volume"] - df["btc_volume"].mean()) / df["btc_volume"].std()
-        df["high_volume"] = (df["volume_zscore"] > 0).astype(int)
+        df["volume_z"] = _zscore(df["btc_volume"])
+        df["high_volume"] = (df["volume_z"] > 0).astype(int)
+
+    # Create lagged variables (1-3 months)
+    for lag in [1, 2, 3]:
+        df[f"substitution_z_lag{lag}"] = df["substitution_z"].shift(lag)
+        df[f"substitution_diff_lag{lag}"] = df["substitution_diff"].shift(lag)
 
     # Regime indicators
     df["pre_institutional"] = (df["date"] < "2020-08-01").astype(int)
@@ -232,177 +264,297 @@ def _calculate_substitution_metrics(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-def _run_regime_analysis(df: pd.DataFrame) -> Dict[str, Any]:
-    """Analyze cash substitution by regime."""
+def _zscore(series: pd.Series) -> pd.Series:
+    """Calculate z-score, handling NaN values."""
+    return (series - series.mean()) / series.std()
+
+
+def _run_stationarity_tests(df: pd.DataFrame) -> Dict[str, Any]:
+    """Run ADF tests on key variables."""
     results = {}
+
+    test_vars = [
+        ("log_btc", "Log BTC (levels)"),
+        ("btc_return", "BTC Return (diff)"),
+        ("substitution_index", "Substitution Index (levels)"),
+        ("substitution_diff", "Substitution Index (diff)"),
+    ]
+
+    for var, label in test_vars:
+        if var in df.columns:
+            series = df[var].dropna()
+            if len(series) > 10:
+                try:
+                    adf_stat, p_value, _, _, crit_values, _ = adfuller(series, autolag="AIC")
+                    results[var] = {
+                        "label": label,
+                        "adf_statistic": adf_stat,
+                        "p_value": p_value,
+                        "stationary": p_value < 0.05,
+                        "critical_1pct": crit_values["1%"],
+                        "critical_5pct": crit_values["5%"],
+                    }
+                except Exception as e:
+                    logger.warning(f"ADF test failed for {var}: {e}")
+
+    return results
+
+
+def _run_regime_analysis(df: pd.DataFrame) -> Dict[str, Any]:
+    """Descriptive regime analysis (levels - for context only)."""
+    results = {}
+    results["note"] = "Levels analysis is descriptive only due to nonstationarity"
 
     # Yearly summary
     yearly = df.groupby("year").agg({
         "currency_seizure_usd": "sum",
         "drug_value_usd": "sum",
-        "btc_price_close": "mean",
+        "btc_price": "mean",
     }).reset_index()
     yearly["ratio"] = yearly["currency_seizure_usd"] / yearly["drug_value_usd"]
-
     results["yearly_summary"] = yearly.to_dict("records")
 
-    # Ratio trend
-    df_clean = df.dropna(subset=["log_ratio"])
-    df_clean["time_idx"] = range(len(df_clean))
-    X = sm.add_constant(df_clean["time_idx"])
-    y = df_clean["log_ratio"]
-    model = sm.OLS(y, X).fit()
+    # Ratio trend (descriptive)
+    df_clean = df.dropna(subset=["log_ratio"]).copy()
+    if len(df_clean) > 10:
+        df_clean["time_idx"] = range(len(df_clean))
+        X = sm.add_constant(df_clean["time_idx"])
+        y = df_clean["log_ratio"]
+        model = sm.OLS(y, X).fit()
 
-    results["ratio_trend"] = {
-        "coefficient": model.params["time_idx"],
-        "p_value": model.pvalues["time_idx"],
-        "r_squared": model.rsquared,
-        "monthly_pct_change": (np.exp(model.params["time_idx"]) - 1) * 100,
-        "is_declining": model.params["time_idx"] < 0 and model.pvalues["time_idx"] < 0.05,
-    }
+        results["ratio_trend"] = {
+            "coefficient": float(model.params["time_idx"]),
+            "p_value": float(model.pvalues["time_idx"]),
+            "monthly_pct_change": float((np.exp(model.params["time_idx"]) - 1) * 100),
+            "is_declining": model.params["time_idx"] < 0 and model.pvalues["time_idx"] < 0.05,
+        }
 
-    # Correlation by regime
-    for regime, label in [("pre_institutional", "Pre-Institutional"),
-                          ("post_institutional", "Post-Institutional")]:
-        sub = df[df[regime] == 1].dropna(subset=["substitution_index", "log_btc"])
-        if len(sub) > 5:
-            corr, p = stats.pearsonr(sub["substitution_index"], sub["log_btc"])
-            results[f"{regime}_correlation"] = {
-                "label": label,
-                "n": len(sub),
-                "correlation": corr,
-                "p_value": p,
-            }
+    return results
 
-    # BTC residual (after S&P control) by regime
-    if "sp500_close" not in df.columns:
-        logger.warning("S&P 500 data not available for residual analysis")
+
+def _run_returns_regression(df: pd.DataFrame) -> Dict[str, Any]:
+    """
+    PRIMARY SPECIFICATION: Single regression on returns.
+
+    Model: btc_return ~ sp500_return + substitution_diff + volume_z + substitution_z * volume_z
+
+    Uses returns (stationary), single regression (no generated regressors),
+    and centered variables for interactions.
+    """
+    results = {}
+
+    required = ["btc_return", "sp500_return", "substitution_diff", "volume_z", "substitution_z"]
+    if not all(col in df.columns for col in required):
+        logger.warning("Missing required columns for returns regression")
         return results
 
-    df_res = df.dropna(subset=["log_btc", "sp500_close", "substitution_index"])
-    if len(df_res) > 20:
-        X = sm.add_constant(df_res["sp500_close"])
-        y = df_res["log_btc"]
-        macro_model = sm.OLS(y, X).fit()
-        df_res["btc_residual"] = macro_model.resid
+    df_clean = df.dropna(subset=required).copy()
+    if len(df_clean) < 20:
+        return results
 
-        for regime, label in [("pre_institutional", "Pre-Institutional"),
-                              ("post_institutional", "Post-Institutional")]:
-            sub = df_res[df_res[regime] == 1]
-            if len(sub) > 5:
-                corr, p = stats.pearsonr(sub["substitution_index"], sub["btc_residual"])
-                results[f"{regime}_residual_correlation"] = {
-                    "label": label,
-                    "n": len(sub),
-                    "correlation": corr,
-                    "p_value": p,
+    # Create interaction with CENTERED variables
+    df_clean["subst_x_vol"] = df_clean["substitution_z"] * df_clean["volume_z"]
+
+    # Single regression with all controls
+    X = df_clean[["sp500_return", "substitution_diff", "volume_z", "subst_x_vol"]]
+    X = sm.add_constant(X)
+    y = df_clean["btc_return"]
+
+    model = sm.OLS(y, X).fit(cov_type="HAC", cov_kwds={"maxlags": 3})
+
+    results["model_summary"] = {
+        "r_squared": float(model.rsquared),
+        "adj_r_squared": float(model.rsquared_adj),
+        "n_obs": int(model.nobs),
+        "durbin_watson": float(durbin_watson(model.resid)),
+    }
+
+    results["coefficients"] = {}
+    for name in model.params.index:
+        results["coefficients"][name] = {
+            "coef": float(model.params[name]),
+            "std_err": float(model.bse[name]),
+            "t_stat": float(model.tvalues[name]),
+            "p_value": float(model.pvalues[name]),
+        }
+
+    # Economic interpretation
+    interact_coef = model.params.get("subst_x_vol", 0)
+    results["interpretation"] = {
+        "interaction_effect": float(interact_coef),
+        "description": (
+            f"When both substitution and volume are 1σ above mean, "
+            f"BTC monthly return is {interact_coef*100:.2f}pp {'lower' if interact_coef < 0 else 'higher'}"
+        ),
+    }
+
+    return results
+
+
+def _run_lagged_regressions(df: pd.DataFrame) -> Dict[str, Any]:
+    """
+    Run lagged specifications for causal inference.
+
+    Contemporaneous effects are weak for causality claims.
+    Lagged substitution (1-3 months) is the primary causal spec.
+    """
+    results = {}
+
+    if "btc_return" not in df.columns or "sp500_return" not in df.columns:
+        return results
+
+    # Test each lag
+    for lag in [1, 2, 3]:
+        lag_var = f"substitution_diff_lag{lag}"
+        if lag_var not in df.columns:
+            continue
+
+        df_clean = df.dropna(subset=["btc_return", "sp500_return", lag_var, "volume_z"]).copy()
+        if len(df_clean) < 20:
+            continue
+
+        # Create lagged interaction
+        subst_z_lag = f"substitution_z_lag{lag}"
+        if subst_z_lag in df_clean.columns:
+            df_clean["subst_x_vol_lag"] = df_clean[subst_z_lag] * df_clean["volume_z"]
+        else:
+            df_clean["subst_x_vol_lag"] = 0
+
+        X = df_clean[["sp500_return", lag_var, "volume_z", "subst_x_vol_lag"]]
+        X = sm.add_constant(X)
+        y = df_clean["btc_return"]
+
+        model = sm.OLS(y, X).fit(cov_type="HAC", cov_kwds={"maxlags": 3})
+
+        results[f"lag_{lag}"] = {
+            "n_obs": int(model.nobs),
+            "r_squared": float(model.rsquared),
+            "substitution_coef": float(model.params.get(lag_var, np.nan)),
+            "substitution_pvalue": float(model.pvalues.get(lag_var, np.nan)),
+            "interaction_coef": float(model.params.get("subst_x_vol_lag", np.nan)),
+            "interaction_pvalue": float(model.pvalues.get("subst_x_vol_lag", np.nan)),
+        }
+
+    # Granger causality test
+    try:
+        df_granger = df[["btc_return", "substitution_diff"]].dropna()
+        if len(df_granger) > 15:
+            granger_results = grangercausalitytests(
+                df_granger[["btc_return", "substitution_diff"]],
+                maxlag=3,
+                verbose=False
+            )
+            results["granger_causality"] = {
+                lag: {
+                    "f_stat": float(granger_results[lag][0]["ssr_ftest"][0]),
+                    "p_value": float(granger_results[lag][0]["ssr_ftest"][1]),
                 }
+                for lag in [1, 2, 3]
+            }
+    except Exception as e:
+        logger.warning(f"Granger test failed: {e}")
 
     return results
 
 
 def _run_volume_interaction_analysis(df: pd.DataFrame) -> Dict[str, Any]:
-    """Test the exit liquidity hypothesis via volume interaction."""
+    """
+    Volume interaction analysis with properly centered variables.
+
+    Key methodological points:
+    - Variables are z-scored BEFORE forming interaction
+    - Single regression with all controls (no two-step residualization)
+    - Uses returns (stationary) as primary specification
+    """
     results = {}
 
-    if "volume_zscore" not in df.columns:
-        logger.warning("Volume data not available for interaction analysis")
+    if "volume_z" not in df.columns:
+        logger.warning("Volume data not available")
         return results
 
-    if "sp500_close" not in df.columns:
-        logger.warning("S&P 500 data not available for interaction analysis")
+    required = ["btc_return", "sp500_return", "substitution_z", "volume_z"]
+    if not all(col in df.columns for col in required):
         return results
 
-    # Get BTC residual after S&P control
-    df_clean = df.dropna(subset=["log_btc", "sp500_close", "substitution_index", "volume_zscore"])
+    df_clean = df.dropna(subset=required).copy()
     if len(df_clean) < 20:
         return results
 
-    X = sm.add_constant(df_clean["sp500_close"])
-    y = df_clean["log_btc"]
-    df_clean["btc_residual"] = sm.OLS(y, X).fit().resid
-
-    # Correlation by volume regime
+    # Split sample correlations (descriptive)
     for vol_regime, label in [(0, "Low Volume"), (1, "High Volume")]:
-        sub = df_clean[df_clean["high_volume"] == vol_regime]
+        sub = df_clean[df_clean["high_volume"] == vol_regime].copy()
         if len(sub) > 10:
-            corr, p = stats.pearsonr(sub["substitution_index"], sub["btc_residual"])
+            corr, p = stats.pearsonr(sub["substitution_z"], sub["btc_return"])
             results[f"correlation_{label.lower().replace(' ', '_')}"] = {
                 "label": label,
                 "n": len(sub),
-                "correlation": corr,
-                "p_value": p,
+                "correlation": float(corr),
+                "p_value": float(p),
             }
 
-    # Interaction regression
-    df_clean["subst_x_volume"] = df_clean["substitution_index"] * df_clean["volume_zscore"]
-    X = sm.add_constant(df_clean[["substitution_index", "volume_zscore", "subst_x_volume"]])
-    y = df_clean["btc_residual"]
-    model = sm.OLS(y, X).fit(cov_type="HAC", cov_kwds={"maxlags": 6})
+    # Create interaction with CENTERED (z-scored) variables
+    df_clean["subst_x_vol"] = df_clean["substitution_z"] * df_clean["volume_z"]
+
+    # Single regression - PRIMARY SPEC
+    X = df_clean[["sp500_return", "substitution_z", "volume_z", "subst_x_vol"]]
+    X = sm.add_constant(X)
+    y = df_clean["btc_return"]
+
+    model = sm.OLS(y, X).fit(cov_type="HAC", cov_kwds={"maxlags": 3})
 
     results["interaction_model"] = {
-        "r_squared": model.rsquared,
+        "r_squared": float(model.rsquared),
+        "durbin_watson": float(durbin_watson(model.resid)),
         "coefficients": {
             name: {
-                "coefficient": model.params[name],
-                "p_value": model.pvalues[name],
+                "coefficient": float(model.params[name]),
+                "std_err": float(model.bse[name]),
+                "p_value": float(model.pvalues[name]),
             }
             for name in model.params.index
         },
-        "durbin_watson": durbin_watson(model.resid),
     }
 
     # Economic significance
-    interact_coef = model.params["subst_x_volume"]
+    interact_coef = model.params.get("subst_x_vol", 0)
     results["economic_significance"] = {
-        "interaction_coefficient": interact_coef,
-        "pct_impact": interact_coef * 100,
-        "interpretation": f"When volume is 1σ above mean AND substitution is 1σ above mean, "
-                         f"BTC is {interact_coef*100:.1f}% lower than macro would predict",
+        "interaction_coefficient": float(interact_coef),
+        "pct_impact_pp": float(interact_coef * 100),
+        "interpretation": (
+            f"When volume is 1σ above mean AND substitution is 1σ above mean, "
+            f"BTC monthly return is {interact_coef*100:.2f}pp "
+            f"{'lower' if interact_coef < 0 else 'higher'}"
+        ),
     }
-
-    # Rolling correlation
-    df_sorted = df_clean.sort_values("date")
-    df_sorted["rolling_corr"] = df_sorted["substitution_index"].rolling(24, min_periods=12).corr(
-        df_sorted["btc_residual"]
-    )
-
-    rolling_by_year = {}
-    for year in df_sorted["date"].dt.year.unique():
-        year_data = df_sorted[df_sorted["date"].dt.year == year]["rolling_corr"].dropna()
-        if len(year_data) > 0:
-            rolling_by_year[int(year)] = float(year_data.mean())
-
-    results["rolling_correlation_by_year"] = rolling_by_year
 
     return results
 
 
 def _run_stress_tests(df: pd.DataFrame) -> Dict[str, Any]:
-    """Run robustness and stress tests."""
+    """
+    Run robustness and stress tests.
+
+    Key fix: Falsification test now uses symmetric functional form
+    (same model on S&P returns vs BTC returns).
+    """
     results = {}
 
-    if "volume_zscore" not in df.columns:
+    required = ["btc_return", "sp500_return", "substitution_z", "volume_z"]
+    if not all(col in df.columns for col in required):
         return results
 
-    if "sp500_close" not in df.columns:
-        return results
-
-    # Prepare data
-    df_clean = df.dropna(subset=["log_btc", "sp500_close", "substitution_index", "volume_zscore"])
+    df_clean = df.dropna(subset=required).copy()
     if len(df_clean) < 20:
         return results
 
-    X = sm.add_constant(df_clean["sp500_close"])
-    y = df_clean["log_btc"]
-    df_clean["btc_residual"] = sm.OLS(y, X).fit().resid
+    # Create interaction
+    df_clean["subst_x_vol"] = df_clean["substitution_z"] * df_clean["volume_z"]
 
-    high_vol = df_clean[df_clean["high_volume"] == 1]
-
+    high_vol = df_clean[df_clean["high_volume"] == 1].copy()
     if len(high_vol) < 10:
         return results
 
-    actual_corr = high_vol["substitution_index"].corr(high_vol["btc_residual"])
+    actual_corr = float(high_vol["substitution_z"].corr(high_vol["btc_return"]))
 
     # 1. Bootstrap confidence interval
     n_boot = 1000
@@ -410,16 +562,16 @@ def _run_stress_tests(df: pd.DataFrame) -> Dict[str, Any]:
     boot_corrs = []
     for _ in range(n_boot):
         sample = high_vol.sample(n=len(high_vol), replace=True)
-        boot_corrs.append(sample["substitution_index"].corr(sample["btc_residual"]))
+        boot_corrs.append(sample["substitution_z"].corr(sample["btc_return"]))
 
     boot_corrs = np.array(boot_corrs)
     ci_low, ci_high = np.percentile(boot_corrs, [2.5, 97.5])
 
     results["bootstrap"] = {
         "actual_correlation": actual_corr,
-        "ci_95_low": ci_low,
-        "ci_95_high": ci_high,
-        "ci_excludes_zero": ci_high < 0 or ci_low > 0,
+        "ci_95_low": float(ci_low),
+        "ci_95_high": float(ci_high),
+        "ci_excludes_zero": bool(ci_high < 0 or ci_low > 0),
     }
 
     # 2. Placebo test
@@ -427,11 +579,11 @@ def _run_stress_tests(df: pd.DataFrame) -> Dict[str, Any]:
     placebo_corrs = []
     for _ in range(n_placebo):
         df_placebo = df_clean.copy()
-        df_placebo["substitution_index"] = np.random.permutation(df_placebo["substitution_index"].values)
+        df_placebo["substitution_z"] = np.random.permutation(df_placebo["substitution_z"].values)
         hv = df_placebo[df_placebo["high_volume"] == 1]
-        placebo_corrs.append(hv["substitution_index"].corr(hv["btc_residual"]))
+        placebo_corrs.append(hv["substitution_z"].corr(hv["btc_return"]))
 
-    placebo_pvalue = (np.array(placebo_corrs) <= actual_corr).mean()
+    placebo_pvalue = float((np.array(placebo_corrs) <= actual_corr).mean())
 
     results["placebo_test"] = {
         "actual_correlation": actual_corr,
@@ -443,7 +595,7 @@ def _run_stress_tests(df: pd.DataFrame) -> Dict[str, Any]:
     loo_corrs = []
     for i in high_vol.index:
         subset = high_vol.drop(i)
-        loo_corrs.append(subset["substitution_index"].corr(subset["btc_residual"]))
+        loo_corrs.append(subset["substitution_z"].corr(subset["btc_return"]))
 
     loo_corrs = np.array(loo_corrs)
 
@@ -455,21 +607,25 @@ def _run_stress_tests(df: pd.DataFrame) -> Dict[str, Any]:
         "all_negative": bool((loo_corrs < 0).all()),
     }
 
-    # 4. Falsification test (S&P 500)
-    if "sp500_close" in df_clean.columns:
-        df_clean["log_sp500"] = np.log(df_clean["sp500_close"])
-        df_clean["sp500_residual"] = df_clean["log_sp500"] - df_clean["log_sp500"].mean()
-        df_clean["subst_x_volume"] = df_clean["substitution_index"] * df_clean["volume_zscore"]
+    # 4. SYMMETRIC FALSIFICATION TEST
+    # Run the SAME model on S&P returns as dependent variable
+    # If the effect is BTC-specific, it should NOT appear for S&P
+    X_btc = sm.add_constant(df_clean[["substitution_z", "volume_z", "subst_x_vol"]])
+    y_btc = df_clean["btc_return"]
+    model_btc = sm.OLS(y_btc, X_btc).fit(cov_type="HAC", cov_kwds={"maxlags": 3})
 
-        X = sm.add_constant(df_clean[["substitution_index", "volume_zscore", "subst_x_volume"]])
-        y = df_clean["sp500_residual"]
-        model_sp = sm.OLS(y, X).fit()
+    X_sp = sm.add_constant(df_clean[["substitution_z", "volume_z", "subst_x_vol"]])
+    y_sp = df_clean["sp500_return"]
+    model_sp = sm.OLS(y_sp, X_sp).fit(cov_type="HAC", cov_kwds={"maxlags": 3})
 
-        results["falsification_sp500"] = {
-            "interaction_coefficient": model_sp.params["subst_x_volume"],
-            "p_value": model_sp.pvalues["subst_x_volume"],
-            "passes": model_sp.pvalues["subst_x_volume"] > 0.1,  # Should NOT be significant
-        }
+    results["falsification_symmetric"] = {
+        "btc_interaction_coef": float(model_btc.params.get("subst_x_vol", np.nan)),
+        "btc_interaction_pvalue": float(model_btc.pvalues.get("subst_x_vol", np.nan)),
+        "sp500_interaction_coef": float(model_sp.params.get("subst_x_vol", np.nan)),
+        "sp500_interaction_pvalue": float(model_sp.pvalues.get("subst_x_vol", np.nan)),
+        "passes": model_sp.pvalues.get("subst_x_vol", 0) > 0.1,
+        "note": "Same model on BTC vs S&P returns - effect should be BTC-specific",
+    }
 
     return results
 
@@ -478,7 +634,6 @@ def _save_results(results: Dict[str, Any], df: pd.DataFrame, output_dir: Path) -
     """Save analysis results and data."""
     import json
 
-    # Save JSON results
     def convert_types(obj):
         if isinstance(obj, dict):
             return {k: convert_types(v) for k, v in obj.items()}
@@ -497,7 +652,6 @@ def _save_results(results: Dict[str, Any], df: pd.DataFrame, output_dir: Path) -
     with open(output_dir / "results.json", "w") as f:
         json.dump(convert_types(results), f, indent=2)
 
-    # Save processed data
     df.to_csv(output_dir / "cash_substitution_data.csv", index=False)
 
 
@@ -505,8 +659,14 @@ def _generate_report(results: Dict[str, Any]) -> str:
     """Generate text report of analysis results."""
     lines = []
     lines.append("=" * 80)
-    lines.append("CASH SUBSTITUTION ANALYSIS")
+    lines.append("CASH SUBSTITUTION ANALYSIS (METHODOLOGICALLY CORRECTED)")
     lines.append("=" * 80)
+    lines.append("")
+    lines.append("Methodology notes:")
+    lines.append("- Primary spec uses log returns (stationary)")
+    lines.append("- Single regression with controls (no two-step residualization)")
+    lines.append("- Variables z-scored before forming interactions")
+    lines.append("- Lagged specs (1-3mo) for causal inference")
     lines.append("")
 
     # Data summary
@@ -517,49 +677,72 @@ def _generate_report(results: Dict[str, Any]) -> str:
         lines.append(f"Date range: {results['data_summary'].get('date_range', 'N/A')}")
         lines.append("")
 
-    # Ratio trend
-    if "ratio_trend" in results:
-        trend = results["ratio_trend"]
-        lines.append("CASH/DRUG RATIO TREND")
+    # Stationarity tests
+    if "stationarity" in results:
+        lines.append("STATIONARITY TESTS (ADF)")
         lines.append("-" * 40)
-        lines.append(f"Monthly change: {trend.get('monthly_pct_change', 0):.2f}%")
-        lines.append(f"R²: {trend.get('r_squared', 0):.4f}")
-        lines.append(f"Declining significantly: {trend.get('is_declining', False)}")
+        for var, test in results["stationarity"].items():
+            status = "STATIONARY" if test.get("stationary") else "NON-STATIONARY"
+            lines.append(f"  {test.get('label', var)}: p={test.get('p_value', 1):.4f} [{status}]")
         lines.append("")
 
-    # Regime correlations
-    lines.append("CORRELATION BY REGIME")
-    lines.append("-" * 40)
-    for key in ["pre_institutional_correlation", "post_institutional_correlation",
-                "pre_institutional_residual_correlation", "post_institutional_residual_correlation"]:
-        if key in results.get("regime_analysis", {}):
-            data = results["regime_analysis"][key]
-            sig = "***" if data["p_value"] < 0.01 else "**" if data["p_value"] < 0.05 else "*" if data["p_value"] < 0.1 else ""
-            lines.append(f"{data['label']}: r = {data['correlation']:.4f}, p = {data['p_value']:.4f} {sig} (n={data['n']})")
-    lines.append("")
+    # Primary returns model
+    if "primary_returns_model" in results:
+        prm = results["primary_returns_model"]
+        lines.append("PRIMARY SPECIFICATION: Returns Regression")
+        lines.append("-" * 40)
+        if "model_summary" in prm:
+            lines.append(f"R²: {prm['model_summary'].get('r_squared', 0):.4f}")
+            lines.append(f"N: {prm['model_summary'].get('n_obs', 0)}")
+            lines.append(f"DW: {prm['model_summary'].get('durbin_watson', 0):.2f}")
+        if "coefficients" in prm:
+            lines.append("\nCoefficients:")
+            for name, coef in prm["coefficients"].items():
+                sig = "***" if coef["p_value"] < 0.01 else "**" if coef["p_value"] < 0.05 else "*" if coef["p_value"] < 0.1 else ""
+                lines.append(f"  {name}: {coef['coef']:.4f} (se={coef['std_err']:.4f}, p={coef['p_value']:.4f}) {sig}")
+        if "interpretation" in prm:
+            lines.append(f"\n{prm['interpretation'].get('description', '')}")
+        lines.append("")
+
+    # Lagged models
+    if "lagged_models" in results:
+        lm = results["lagged_models"]
+        lines.append("LAGGED SPECIFICATIONS (Causal)")
+        lines.append("-" * 40)
+        for lag_key in ["lag_1", "lag_2", "lag_3"]:
+            if lag_key in lm:
+                lag_data = lm[lag_key]
+                sig = "***" if lag_data.get("interaction_pvalue", 1) < 0.01 else "**" if lag_data.get("interaction_pvalue", 1) < 0.05 else "*" if lag_data.get("interaction_pvalue", 1) < 0.1 else ""
+                lines.append(f"  {lag_key}: interaction={lag_data.get('interaction_coef', 0):.4f} "
+                           f"(p={lag_data.get('interaction_pvalue', 1):.4f}) {sig}")
+        if "granger_causality" in lm:
+            lines.append("\n  Granger Causality (Subst -> BTC):")
+            for lag, gc in lm["granger_causality"].items():
+                sig = "***" if gc["p_value"] < 0.01 else "**" if gc["p_value"] < 0.05 else "*" if gc["p_value"] < 0.1 else ""
+                lines.append(f"    Lag {lag}: F={gc['f_stat']:.2f}, p={gc['p_value']:.4f} {sig}")
+        lines.append("")
 
     # Volume interaction
     if "volume_interaction" in results:
         vi = results["volume_interaction"]
-        lines.append("VOLUME INTERACTION (Exit Liquidity)")
+        lines.append("VOLUME INTERACTION (Centered Variables)")
         lines.append("-" * 40)
 
         for key in ["correlation_low_volume", "correlation_high_volume"]:
             if key in vi:
                 data = vi[key]
                 sig = "***" if data["p_value"] < 0.01 else "**" if data["p_value"] < 0.05 else "*" if data["p_value"] < 0.1 else ""
-                lines.append(f"{data['label']}: r = {data['correlation']:.4f}, p = {data['p_value']:.4f} {sig}")
+                lines.append(f"  {data['label']}: r={data['correlation']:.4f} (p={data['p_value']:.4f}) {sig}")
 
         if "interaction_model" in vi:
             model = vi["interaction_model"]
-            lines.append(f"\nInteraction Model R²: {model['r_squared']:.4f}")
-            for name, coef in model["coefficients"].items():
-                sig = "***" if coef["p_value"] < 0.01 else "**" if coef["p_value"] < 0.05 else "*" if coef["p_value"] < 0.1 else ""
-                lines.append(f"  {name}: {coef['coefficient']:.4f} (p={coef['p_value']:.4f}) {sig}")
+            lines.append(f"\n  Model R²: {model['r_squared']:.4f}")
+            interact = model["coefficients"].get("subst_x_vol", {})
+            sig = "***" if interact.get("p_value", 1) < 0.01 else "**" if interact.get("p_value", 1) < 0.05 else "*" if interact.get("p_value", 1) < 0.1 else ""
+            lines.append(f"  Interaction: {interact.get('coefficient', 0):.4f} (p={interact.get('p_value', 1):.4f}) {sig}")
 
         if "economic_significance" in vi:
-            lines.append(f"\n{vi['economic_significance']['interpretation']}")
-
+            lines.append(f"\n  {vi['economic_significance']['interpretation']}")
         lines.append("")
 
     # Stress tests
@@ -569,20 +752,34 @@ def _generate_report(results: Dict[str, Any]) -> str:
         lines.append("-" * 40)
 
         if "bootstrap" in st:
-            lines.append(f"Bootstrap 95% CI: [{st['bootstrap']['ci_95_low']:.4f}, {st['bootstrap']['ci_95_high']:.4f}]")
-            lines.append(f"  CI excludes zero: {st['bootstrap']['ci_excludes_zero']}")
+            lines.append(f"  Bootstrap 95% CI: [{st['bootstrap']['ci_95_low']:.4f}, {st['bootstrap']['ci_95_high']:.4f}]")
+            lines.append(f"    Excludes zero: {st['bootstrap']['ci_excludes_zero']}")
 
         if "placebo_test" in st:
-            lines.append(f"Placebo p-value: {st['placebo_test']['placebo_p_value']:.4f}")
-            lines.append(f"  Passes: {st['placebo_test']['passes']}")
+            lines.append(f"  Placebo p-value: {st['placebo_test']['placebo_p_value']:.4f}")
+            lines.append(f"    Passes: {st['placebo_test']['passes']}")
 
         if "leave_one_out" in st:
-            lines.append(f"Leave-one-out: all negative = {st['leave_one_out']['all_negative']}")
+            lines.append(f"  Leave-one-out: all negative = {st['leave_one_out']['all_negative']}")
 
-        if "falsification_sp500" in st:
-            lines.append(f"Falsification (S&P 500): p = {st['falsification_sp500']['p_value']:.4f}")
-            lines.append(f"  Passes (not significant): {st['falsification_sp500']['passes']}")
+        if "falsification_symmetric" in st:
+            fs = st["falsification_symmetric"]
+            lines.append(f"\n  SYMMETRIC FALSIFICATION (same model, different DV):")
+            lines.append(f"    BTC interaction: {fs['btc_interaction_coef']:.4f} (p={fs['btc_interaction_pvalue']:.4f})")
+            lines.append(f"    S&P interaction: {fs['sp500_interaction_coef']:.4f} (p={fs['sp500_interaction_pvalue']:.4f})")
+            lines.append(f"    Passes (S&P not significant): {fs['passes']}")
 
+        lines.append("")
+
+    # Descriptive regime analysis
+    if "regime_analysis" in results:
+        ra = results["regime_analysis"]
+        lines.append("DESCRIPTIVE: Cash/Drug Ratio Trend (levels - context only)")
+        lines.append("-" * 40)
+        if "ratio_trend" in ra:
+            trend = ra["ratio_trend"]
+            lines.append(f"  Monthly change: {trend.get('monthly_pct_change', 0):.2f}%")
+            lines.append(f"  Declining: {trend.get('is_declining', False)}")
         lines.append("")
 
     lines.append("=" * 80)
