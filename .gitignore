@@ -37,6 +37,8 @@ ENV/
 data/raw/*.csv
 data/raw/*.xls
 data/raw/*.xlsx
+data/raw/**/*.json
+data/raw/**/*.zip
 data/processed/*.csv
 data/raw/**/*.csv
 

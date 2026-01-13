@@ -124,7 +124,31 @@ def run_cash_substitution_analysis(
     logger.info("Running stress tests...")
     results["stress_tests"] = _run_stress_tests(df)
 
-    # Step 9: Save results
+    # Step 9: Extended lag analysis (reversal test)
+    logger.info("Running extended lag analysis...")
+    results["extended_lags"] = _run_extended_lag_analysis(df)
+
+    # Step 10: Reverse causality test
+    logger.info("Testing reverse causality...")
+    results["reverse_causality"] = _run_reverse_causality_test(df)
+
+    # Step 11: Volatility prediction test
+    logger.info("Testing volatility prediction...")
+    results["volatility_test"] = _run_volatility_test(df)
+
+    # Step 12: Return reversal test
+    logger.info("Testing return reversal...")
+    results["return_reversal"] = _run_return_reversal_test(df)
+
+    # Step 13: Structural break analysis
+    logger.info("Running structural break analysis...")
+    results["structural_breaks"] = _run_structural_break_analysis(df)
+
+    # Step 14: Floor effect / asymmetric analysis
+    logger.info("Running floor effect analysis...")
+    results["floor_effect"] = _run_floor_effect_analysis(df)
+
+    # Step 15: Save results
     _save_results(results, df, output_dir)
 
     # Step 10: Generate report
@@ -630,6 +654,691 @@ def _run_stress_tests(df: pd.DataFrame) -> Dict[str, Any]:
     return results
 
 
+def _run_extended_lag_analysis(df: pd.DataFrame) -> Dict[str, Any]:
+    """
+    Test for reversal at longer lags (4-6 months).
+
+    If criminals buy, then sell later, we'd expect:
+    - Positive effect at lag 1-2
+    - Negative effect at lag 4-6 (reversal/dump)
+    """
+    results = {}
+
+    if "btc_return" not in df.columns or "sp500_return" not in df.columns:
+        return results
+
+    df = df.copy()
+
+    # Create extended lags
+    for lag in range(1, 7):
+        df[f"substitution_z_lag{lag}"] = df["substitution_z"].shift(lag)
+        df[f"subst_x_vol_lag{lag}"] = df[f"substitution_z_lag{lag}"] * df["volume_z"]
+
+    # Test each lag
+    lag_results = []
+    for lag in range(1, 7):
+        required = ["btc_return", "sp500_return", f"substitution_z_lag{lag}", "volume_z"]
+        df_clean = df.dropna(subset=required + [f"subst_x_vol_lag{lag}"]).copy()
+
+        if len(df_clean) < 15:
+            continue
+
+        X = df_clean[["sp500_return", f"substitution_z_lag{lag}", "volume_z", f"subst_x_vol_lag{lag}"]]
+        X = sm.add_constant(X)
+        y = df_clean["btc_return"]
+
+        model = sm.OLS(y, X).fit(cov_type="HAC", cov_kwds={"maxlags": 3})
+
+        interact_var = f"subst_x_vol_lag{lag}"
+        lag_results.append({
+            "lag": lag,
+            "n_obs": int(model.nobs),
+            "interaction_coef": float(model.params.get(interact_var, np.nan)),
+            "interaction_pvalue": float(model.pvalues.get(interact_var, np.nan)),
+            "r_squared": float(model.rsquared),
+        })
+
+    results["lag_coefficients"] = lag_results
+
+    # Check for reversal pattern
+    if len(lag_results) >= 4:
+        early_lags = [r for r in lag_results if r["lag"] <= 2]
+        late_lags = [r for r in lag_results if r["lag"] >= 4]
+
+        if early_lags and late_lags:
+            avg_early = np.mean([r["interaction_coef"] for r in early_lags])
+            avg_late = np.mean([r["interaction_coef"] for r in late_lags])
+
+            results["reversal_test"] = {
+                "avg_early_lag_coef": float(avg_early),
+                "avg_late_lag_coef": float(avg_late),
+                "sign_change": (avg_early > 0 and avg_late < 0) or (avg_early < 0 and avg_late > 0),
+                "interpretation": (
+                    "REVERSAL DETECTED: Early positive, late negative" if (avg_early > 0 and avg_late < 0) else
+                    "NO REVERSAL: Effect decays but doesn't reverse"
+                ),
+            }
+
+    return results
+
+
+def _run_reverse_causality_test(df: pd.DataFrame) -> Dict[str, Any]:
+    """
+    Test if BTC returns predict future substitution.
+
+    If high BTC returns attract criminal usage, we'd expect:
+    - btc_return_t → substitution_index_t+1 (positive)
+    """
+    results = {}
+
+    if "btc_return" not in df.columns or "substitution_diff" not in df.columns:
+        return results
+
+    df = df.copy()
+
+    # Create leads of substitution (substitution AFTER btc return)
+    for lead in [1, 2, 3]:
+        df[f"substitution_diff_lead{lead}"] = df["substitution_diff"].shift(-lead)
+
+    # Test: Does btc_return predict future substitution?
+    for lead in [1, 2, 3]:
+        lead_var = f"substitution_diff_lead{lead}"
+        required = ["btc_return", "sp500_return", lead_var]
+        df_clean = df.dropna(subset=required).copy()
+
+        if len(df_clean) < 15:
+            continue
+
+        # DV = future substitution, IV = current BTC return
+        X = df_clean[["btc_return", "sp500_return"]]
+        X = sm.add_constant(X)
+        y = df_clean[lead_var]
+
+        model = sm.OLS(y, X).fit(cov_type="HAC", cov_kwds={"maxlags": 3})
+
+        results[f"lead_{lead}"] = {
+            "n_obs": int(model.nobs),
+            "btc_return_coef": float(model.params.get("btc_return", np.nan)),
+            "btc_return_pvalue": float(model.pvalues.get("btc_return", np.nan)),
+            "r_squared": float(model.rsquared),
+        }
+
+    # Granger test: BTC → Substitution (reverse direction)
+    try:
+        df_granger = df[["substitution_diff", "btc_return"]].dropna()
+        if len(df_granger) > 15:
+            granger_results = grangercausalitytests(
+                df_granger[["substitution_diff", "btc_return"]],  # order: [DV, IV]
+                maxlag=3,
+                verbose=False
+            )
+            results["granger_btc_to_subst"] = {
+                lag: {
+                    "f_stat": float(granger_results[lag][0]["ssr_ftest"][0]),
+                    "p_value": float(granger_results[lag][0]["ssr_ftest"][1]),
+                }
+                for lag in [1, 2, 3]
+            }
+    except Exception as e:
+        logger.warning(f"Reverse Granger test failed: {e}")
+
+    return results
+
+
+def _run_volatility_test(df: pd.DataFrame) -> Dict[str, Any]:
+    """
+    Test if criminal activity predicts BTC volatility.
+
+    Demand pressure could manifest as both returns AND volatility.
+    """
+    results = {}
+
+    if "btc_return" not in df.columns:
+        return results
+
+    df = df.copy()
+
+    # Calculate realized volatility (absolute returns as proxy)
+    df["btc_volatility"] = df["btc_return"].abs()
+
+    # Also try squared returns
+    df["btc_vol_squared"] = df["btc_return"] ** 2
+
+    # Create lagged interaction for volatility prediction
+    if "substitution_z" in df.columns and "volume_z" in df.columns:
+        df["subst_x_vol_lag1"] = df["substitution_z"].shift(1) * df["volume_z"].shift(1)
+
+    required = ["btc_volatility", "substitution_z", "volume_z"]
+    if not all(col in df.columns for col in required):
+        return results
+
+    df_clean = df.dropna(subset=required + ["subst_x_vol_lag1"]).copy()
+
+    if len(df_clean) < 15:
+        return results
+
+    # Test: Does lagged (subst × vol) predict volatility?
+    X = df_clean[["substitution_z", "volume_z", "subst_x_vol_lag1"]]
+    X = sm.add_constant(X)
+    y = df_clean["btc_volatility"]
+
+    model = sm.OLS(y, X).fit(cov_type="HAC", cov_kwds={"maxlags": 3})
+
+    results["volatility_model"] = {
+        "n_obs": int(model.nobs),
+        "r_squared": float(model.rsquared),
+        "interaction_coef": float(model.params.get("subst_x_vol_lag1", np.nan)),
+        "interaction_pvalue": float(model.pvalues.get("subst_x_vol_lag1", np.nan)),
+    }
+
+    # Interpretation
+    interact_coef = model.params.get("subst_x_vol_lag1", 0)
+    interact_p = model.pvalues.get("subst_x_vol_lag1", 1)
+
+    results["interpretation"] = {
+        "effect": "positive" if interact_coef > 0 else "negative",
+        "significant": interact_p < 0.1,
+        "narrative": (
+            f"Criminal activity {'predicts higher' if interact_coef > 0 else 'predicts lower'} "
+            f"volatility (coef={interact_coef:.4f}, p={interact_p:.4f})"
+        ),
+    }
+
+    return results
+
+
+def _run_floor_effect_analysis(df: pd.DataFrame) -> Dict[str, Any]:
+    """
+    Test if criminal utility acts as a "floor" for BTC value.
+
+    Thesis: Criminal utility is the fundamental value driver. When speculation
+    fades (down markets), this fundamental should matter MORE.
+
+    Tests:
+    1. Split sample: effect in up vs down S&P months
+    2. Asymmetric model: (down_market × substitution × volume) interaction
+    3. Floor effect: In down markets, does high substitution = BTC outperforms S&P?
+    4. Drawdown protection: Does high substitution reduce BTC drawdowns?
+    """
+    results = {}
+
+    required = ["btc_return", "sp500_return", "substitution_z", "volume_z"]
+    if not all(col in df.columns for col in required):
+        return results
+
+    df = df.copy()
+
+    # Create lagged variables
+    df["substitution_z_lag1"] = df["substitution_z"].shift(1)
+    df["subst_x_vol_lag1"] = df["substitution_z_lag1"] * df["volume_z"]
+
+    # Define market regimes
+    df["down_market"] = (df["sp500_return"] < 0).astype(int)
+    df["up_market"] = (df["sp500_return"] >= 0).astype(int)
+
+    # Also try using lagged market condition (known at decision time)
+    df["down_market_lag1"] = df["down_market"].shift(1)
+
+    df_clean = df.dropna(subset=["btc_return", "sp500_return", "substitution_z_lag1",
+                                  "volume_z", "subst_x_vol_lag1", "down_market"]).copy()
+
+    if len(df_clean) < 20:
+        return results
+
+    # 1. Split sample: up vs down markets
+    down_months = df_clean[df_clean["down_market"] == 1].copy()
+    up_months = df_clean[df_clean["down_market"] == 0].copy()
+
+    results["sample_sizes"] = {
+        "down_months": len(down_months),
+        "up_months": len(up_months),
+    }
+
+    for regime_name, regime_df in [("down_market", down_months), ("up_market", up_months)]:
+        if len(regime_df) < 10:
+            results[regime_name] = {"insufficient_data": True, "n": len(regime_df)}
+            continue
+
+        X = regime_df[["sp500_return", "substitution_z_lag1", "volume_z", "subst_x_vol_lag1"]]
+        X = sm.add_constant(X)
+        y = regime_df["btc_return"]
+
+        try:
+            model = sm.OLS(y, X).fit(cov_type="HAC", cov_kwds={"maxlags": 2})
+            results[regime_name] = {
+                "n_obs": int(model.nobs),
+                "r_squared": float(model.rsquared),
+                "interaction_coef": float(model.params.get("subst_x_vol_lag1", np.nan)),
+                "interaction_se": float(model.bse.get("subst_x_vol_lag1", np.nan)),
+                "interaction_pvalue": float(model.pvalues.get("subst_x_vol_lag1", np.nan)),
+                "sp500_beta": float(model.params.get("sp500_return", np.nan)),
+            }
+        except Exception as e:
+            results[regime_name] = {"error": str(e)}
+
+    # Compare coefficients between regimes
+    if ("down_market" in results and "up_market" in results and
+        not results["down_market"].get("insufficient_data") and
+        not results["up_market"].get("insufficient_data")):
+
+        coef_down = results["down_market"]["interaction_coef"]
+        coef_up = results["up_market"]["interaction_coef"]
+        se_down = results["down_market"]["interaction_se"]
+        se_up = results["up_market"]["interaction_se"]
+
+        diff = coef_down - coef_up
+        se_diff = np.sqrt(se_down**2 + se_up**2)
+        z_stat = diff / se_diff if se_diff > 0 else 0
+        p_diff = 2 * (1 - stats.norm.cdf(abs(z_stat)))
+
+        results["regime_comparison"] = {
+            "down_coef": float(coef_down),
+            "up_coef": float(coef_up),
+            "difference": float(diff),
+            "z_statistic": float(z_stat),
+            "p_value": float(p_diff),
+            "stronger_in_down": coef_down > coef_up,
+            "interpretation": (
+                f"Effect is {'STRONGER' if coef_down > coef_up else 'WEAKER'} in down markets "
+                f"({coef_down:+.4f} vs {coef_up:+.4f}, p={p_diff:.4f})"
+            ),
+        }
+
+    # 2. Asymmetric model with three-way interaction
+    df_clean["down_x_interact"] = df_clean["down_market"] * df_clean["subst_x_vol_lag1"]
+
+    X_asym = df_clean[["sp500_return", "substitution_z_lag1", "volume_z",
+                        "subst_x_vol_lag1", "down_market", "down_x_interact"]]
+    X_asym = sm.add_constant(X_asym)
+    y_asym = df_clean["btc_return"]
+
+    try:
+        model_asym = sm.OLS(y_asym, X_asym).fit(cov_type="HAC", cov_kwds={"maxlags": 3})
+        results["asymmetric_model"] = {
+            "n_obs": int(model_asym.nobs),
+            "r_squared": float(model_asym.rsquared),
+            "base_effect": {
+                "coef": float(model_asym.params.get("subst_x_vol_lag1", np.nan)),
+                "pvalue": float(model_asym.pvalues.get("subst_x_vol_lag1", np.nan)),
+                "interpretation": "Effect in UP markets",
+            },
+            "down_market_shift": {
+                "coef": float(model_asym.params.get("down_x_interact", np.nan)),
+                "pvalue": float(model_asym.pvalues.get("down_x_interact", np.nan)),
+                "interpretation": "ADDITIONAL effect in DOWN markets",
+            },
+            "total_effect_in_down": float(
+                model_asym.params.get("subst_x_vol_lag1", 0) +
+                model_asym.params.get("down_x_interact", 0)
+            ),
+        }
+    except Exception as e:
+        results["asymmetric_model"] = {"error": str(e)}
+
+    # 3. Floor effect: BTC excess return in down markets
+    # Does high substitution predict BTC outperforming S&P in down months?
+    df_clean["btc_excess"] = df_clean["btc_return"] - df_clean["sp500_return"]
+
+    down_only = df_clean[df_clean["down_market"] == 1].copy()
+    if len(down_only) >= 10:
+        X_floor = down_only[["substitution_z_lag1", "volume_z", "subst_x_vol_lag1"]]
+        X_floor = sm.add_constant(X_floor)
+        y_floor = down_only["btc_excess"]
+
+        try:
+            model_floor = sm.OLS(y_floor, X_floor).fit(cov_type="HAC", cov_kwds={"maxlags": 2})
+            results["floor_effect"] = {
+                "n_obs": int(model_floor.nobs),
+                "r_squared": float(model_floor.rsquared),
+                "interaction_coef": float(model_floor.params.get("subst_x_vol_lag1", np.nan)),
+                "interaction_pvalue": float(model_floor.pvalues.get("subst_x_vol_lag1", np.nan)),
+                "interpretation": (
+                    "In DOWN months: does high (subst × vol) predict BTC beating S&P?"
+                ),
+            }
+
+            # Economic significance
+            interact_coef = model_floor.params.get("subst_x_vol_lag1", 0)
+            results["floor_effect"]["economic_interpretation"] = (
+                f"When (subst × vol) is 1σ above mean in a down month, "
+                f"BTC excess return is {interact_coef*100:+.1f}pp vs S&P"
+            )
+        except Exception as e:
+            results["floor_effect"] = {"error": str(e)}
+
+    # 4. Drawdown analysis: Does high substitution reduce severity of BTC drawdowns?
+    # Look at worst BTC months and see if substitution helped
+    btc_worst_months = df_clean.nsmallest(10, "btc_return").copy()
+    btc_worst_months["subst_quartile"] = pd.qcut(
+        df_clean["substitution_z_lag1"], 4, labels=["Q1", "Q2", "Q3", "Q4"]
+    ).reindex(btc_worst_months.index)
+
+    results["drawdown_analysis"] = {
+        "worst_10_months": {
+            "avg_btc_return": float(btc_worst_months["btc_return"].mean()),
+            "avg_substitution_lag1": float(btc_worst_months["substitution_z_lag1"].mean()),
+            "substitution_quartile_distribution": btc_worst_months["subst_quartile"].value_counts().to_dict(),
+        },
+    }
+
+    # Correlation between substitution and drawdown severity in negative months
+    negative_btc = df_clean[df_clean["btc_return"] < 0].copy()
+    if len(negative_btc) >= 10:
+        corr, p = stats.pearsonr(
+            negative_btc["substitution_z_lag1"],
+            negative_btc["btc_return"]  # More negative = worse drawdown
+        )
+        results["drawdown_analysis"]["drawdown_correlation"] = {
+            "correlation": float(corr),
+            "p_value": float(p),
+            "interpretation": (
+                f"In negative BTC months: correlation between lagged substitution and return is {corr:+.3f} "
+                f"({'higher subst = smaller drawdown' if corr > 0 else 'higher subst = larger drawdown'})"
+            ),
+        }
+
+    return results
+
+
+def _run_structural_break_analysis(df: pd.DataFrame) -> Dict[str, Any]:
+    """
+    Test for structural breaks in the criminal demand effect.
+
+    Key events:
+    - 2020-08: MicroStrategy first BTC purchase (institutional entry)
+    - 2024-01: Spot BTC ETFs approved (massive liquidity)
+
+    Tests:
+    1. Split-sample regressions (pre/post each event)
+    2. Interaction model with regime dummies
+    3. Chow-style F-test for parameter stability
+    """
+    results = {}
+
+    required = ["btc_return", "sp500_return", "substitution_z", "volume_z", "date"]
+    if not all(col in df.columns for col in required):
+        return results
+
+    df = df.copy()
+
+    # Create lagged interaction
+    df["substitution_z_lag1"] = df["substitution_z"].shift(1)
+    df["subst_x_vol_lag1"] = df["substitution_z_lag1"] * df["volume_z"]
+
+    # Define break points
+    breaks = {
+        "microstrategy": pd.Timestamp("2020-08-01"),
+        "etf_filing": pd.Timestamp("2023-06-01"),  # BlackRock ETF filing
+    }
+
+    # Create regime dummies
+    for name, date in breaks.items():
+        df[f"post_{name}"] = (df["date"] >= date).astype(int)
+
+    df_clean = df.dropna(subset=["btc_return", "sp500_return", "substitution_z_lag1",
+                                  "volume_z", "subst_x_vol_lag1"]).copy()
+
+    if len(df_clean) < 20:
+        return results
+
+    # 1. Split-sample analysis for each break
+    for break_name, break_date in breaks.items():
+        pre = df_clean[df_clean["date"] < break_date].copy()
+        post = df_clean[df_clean["date"] >= break_date].copy()
+
+        split_results = {"break_date": str(break_date.date())}
+
+        for period_name, period_df in [("pre", pre), ("post", post)]:
+            if len(period_df) < 10:
+                split_results[period_name] = {"n_obs": len(period_df), "insufficient_data": True}
+                continue
+
+            X = period_df[["sp500_return", "substitution_z_lag1", "volume_z", "subst_x_vol_lag1"]]
+            X = sm.add_constant(X)
+            y = period_df["btc_return"]
+
+            try:
+                model = sm.OLS(y, X).fit(cov_type="HAC", cov_kwds={"maxlags": 3})
+                split_results[period_name] = {
+                    "n_obs": int(model.nobs),
+                    "r_squared": float(model.rsquared),
+                    "interaction_coef": float(model.params.get("subst_x_vol_lag1", np.nan)),
+                    "interaction_se": float(model.bse.get("subst_x_vol_lag1", np.nan)),
+                    "interaction_pvalue": float(model.pvalues.get("subst_x_vol_lag1", np.nan)),
+                }
+            except Exception as e:
+                split_results[period_name] = {"error": str(e)}
+
+        # Test if coefficients are significantly different
+        if ("pre" in split_results and "post" in split_results and
+            not split_results["pre"].get("insufficient_data") and
+            not split_results["post"].get("insufficient_data") and
+            "interaction_coef" in split_results["pre"] and
+            "interaction_coef" in split_results["post"]):
+
+            coef_pre = split_results["pre"]["interaction_coef"]
+            coef_post = split_results["post"]["interaction_coef"]
+            se_pre = split_results["pre"]["interaction_se"]
+            se_post = split_results["post"]["interaction_se"]
+
+            # Wald test for coefficient difference
+            diff = coef_post - coef_pre
+            se_diff = np.sqrt(se_pre**2 + se_post**2)
+            z_stat = diff / se_diff if se_diff > 0 else 0
+            p_diff = 2 * (1 - stats.norm.cdf(abs(z_stat)))
+
+            split_results["coefficient_change"] = {
+                "pre_coef": float(coef_pre),
+                "post_coef": float(coef_post),
+                "difference": float(diff),
+                "z_statistic": float(z_stat),
+                "p_value": float(p_diff),
+                "significant_change": p_diff < 0.1,
+                "direction": "strengthened" if diff > 0 else "weakened",
+            }
+
+        results[f"split_{break_name}"] = split_results
+
+    # 2. Interaction model with regime dummy
+    # Model: btc_return ~ ... + post_etf × (subst_x_vol_lag1)
+    for break_name in breaks.keys():
+        regime_var = f"post_{break_name}"
+        if regime_var not in df_clean.columns:
+            continue
+
+        # Create three-way interaction: regime × substitution × volume
+        df_clean[f"regime_x_interact_{break_name}"] = (
+            df_clean[regime_var] * df_clean["subst_x_vol_lag1"]
+        )
+
+        X = df_clean[["sp500_return", "substitution_z_lag1", "volume_z",
+                      "subst_x_vol_lag1", regime_var, f"regime_x_interact_{break_name}"]]
+        X = sm.add_constant(X)
+        y = df_clean["btc_return"]
+
+        try:
+            model = sm.OLS(y, X).fit(cov_type="HAC", cov_kwds={"maxlags": 3})
+
+            interact_var = f"regime_x_interact_{break_name}"
+            results[f"interaction_model_{break_name}"] = {
+                "n_obs": int(model.nobs),
+                "r_squared": float(model.rsquared),
+                "base_effect": {
+                    "coef": float(model.params.get("subst_x_vol_lag1", np.nan)),
+                    "pvalue": float(model.pvalues.get("subst_x_vol_lag1", np.nan)),
+                },
+                "regime_shift": {
+                    "coef": float(model.params.get(interact_var, np.nan)),
+                    "pvalue": float(model.pvalues.get(interact_var, np.nan)),
+                },
+                "interpretation": _interpret_regime_shift(
+                    model.params.get("subst_x_vol_lag1", 0),
+                    model.params.get(interact_var, 0),
+                    model.pvalues.get(interact_var, 1),
+                    break_name
+                ),
+            }
+        except Exception as e:
+            results[f"interaction_model_{break_name}"] = {"error": str(e)}
+
+    # 3. Chow test (F-test for structural break)
+    for break_name, break_date in breaks.items():
+        pre = df_clean[df_clean["date"] < break_date].copy()
+        post = df_clean[df_clean["date"] >= break_date].copy()
+
+        if len(pre) < 10 or len(post) < 10:
+            continue
+
+        # Pooled model
+        X_pooled = df_clean[["sp500_return", "substitution_z_lag1", "volume_z", "subst_x_vol_lag1"]]
+        X_pooled = sm.add_constant(X_pooled)
+        y_pooled = df_clean["btc_return"]
+        model_pooled = sm.OLS(y_pooled, X_pooled).fit()
+        ssr_pooled = model_pooled.ssr
+
+        # Pre model
+        X_pre = sm.add_constant(pre[["sp500_return", "substitution_z_lag1", "volume_z", "subst_x_vol_lag1"]])
+        model_pre = sm.OLS(pre["btc_return"], X_pre).fit()
+        ssr_pre = model_pre.ssr
+
+        # Post model
+        X_post = sm.add_constant(post[["sp500_return", "substitution_z_lag1", "volume_z", "subst_x_vol_lag1"]])
+        model_post = sm.OLS(post["btc_return"], X_post).fit()
+        ssr_post = model_post.ssr
+
+        # Chow F-statistic
+        k = X_pooled.shape[1]  # number of parameters
+        n = len(df_clean)
+        f_stat = ((ssr_pooled - (ssr_pre + ssr_post)) / k) / ((ssr_pre + ssr_post) / (n - 2*k))
+        p_value = 1 - stats.f.cdf(f_stat, k, n - 2*k)
+
+        results[f"chow_test_{break_name}"] = {
+            "f_statistic": float(f_stat),
+            "p_value": float(p_value),
+            "structural_break": p_value < 0.1,
+            "interpretation": (
+                f"Structural break {'detected' if p_value < 0.1 else 'NOT detected'} "
+                f"at {break_date.strftime('%Y-%m')} (p={p_value:.4f})"
+            ),
+        }
+
+    return results
+
+
+def _interpret_regime_shift(base_coef: float, shift_coef: float, shift_p: float, break_name: str) -> str:
+    """Generate interpretation of regime shift in criminal demand effect."""
+    total_post = base_coef + shift_coef
+
+    if shift_p > 0.1:
+        return f"No significant change in effect after {break_name}"
+
+    if base_coef > 0 and shift_coef < 0:
+        if total_post < 0:
+            return f"Effect REVERSED after {break_name}: was positive, now negative"
+        else:
+            return f"Effect WEAKENED after {break_name}: still positive but smaller"
+    elif base_coef > 0 and shift_coef > 0:
+        return f"Effect STRENGTHENED after {break_name}"
+    elif base_coef < 0 and shift_coef > 0:
+        if total_post > 0:
+            return f"Effect REVERSED after {break_name}: was negative, now positive"
+        else:
+            return f"Effect WEAKENED after {break_name}: still negative but smaller"
+    elif base_coef < 0 and shift_coef < 0:
+        return f"Effect STRENGTHENED (more negative) after {break_name}"
+    else:
+        return f"Ambiguous change after {break_name}"
+
+
+def _run_return_reversal_test(df: pd.DataFrame) -> Dict[str, Any]:
+    """
+    Test for return reversal after high (substitution × volume) months.
+
+    If there's pump-and-dump behavior:
+    - High (subst × vol) in T-1 → High returns in T → Negative returns in T+1
+
+    Test: Does return_t negatively predict return_t+1 when (subst × vol)_t-1 was high?
+    """
+    results = {}
+
+    if "btc_return" not in df.columns:
+        return results
+
+    df = df.copy()
+
+    # Create lead return (next month's return)
+    df["btc_return_lead1"] = df["btc_return"].shift(-1)
+
+    # Create lagged interaction
+    if "substitution_z" in df.columns and "volume_z" in df.columns:
+        df["subst_x_vol_lag1"] = df["substitution_z"].shift(1) * df["volume_z"].shift(1)
+        # Also create current return × lagged interaction
+        df["return_x_laginteract"] = df["btc_return"] * df["subst_x_vol_lag1"]
+
+    required = ["btc_return", "btc_return_lead1", "subst_x_vol_lag1"]
+    if not all(col in df.columns for col in required):
+        return results
+
+    df_clean = df.dropna(subset=required + ["return_x_laginteract"]).copy()
+
+    if len(df_clean) < 15:
+        return results
+
+    # Model: return_t+1 ~ return_t + (subst×vol)_t-1 + return_t × (subst×vol)_t-1
+    # The interaction tests: does the return-reversal pattern depend on criminal activity?
+    X = df_clean[["btc_return", "subst_x_vol_lag1", "return_x_laginteract"]]
+    X = sm.add_constant(X)
+    y = df_clean["btc_return_lead1"]
+
+    model = sm.OLS(y, X).fit(cov_type="HAC", cov_kwds={"maxlags": 3})
+
+    results["reversal_model"] = {
+        "n_obs": int(model.nobs),
+        "r_squared": float(model.rsquared),
+        "return_persistence": {
+            "coef": float(model.params.get("btc_return", np.nan)),
+            "pvalue": float(model.pvalues.get("btc_return", np.nan)),
+        },
+        "three_way_interaction": {
+            "coef": float(model.params.get("return_x_laginteract", np.nan)),
+            "pvalue": float(model.pvalues.get("return_x_laginteract", np.nan)),
+        },
+    }
+
+    # Simple persistence test (baseline)
+    baseline_X = sm.add_constant(df_clean["btc_return"])
+    baseline_model = sm.OLS(df_clean["btc_return_lead1"], baseline_X).fit()
+
+    results["baseline_persistence"] = {
+        "coef": float(baseline_model.params.get("btc_return", np.nan)),
+        "pvalue": float(baseline_model.pvalues.get("btc_return", np.nan)),
+        "interpretation": (
+            "momentum" if baseline_model.params.get("btc_return", 0) > 0 else "reversal"
+        ),
+    }
+
+    # Split sample: reversal pattern in high vs low criminal activity months
+    if "subst_x_vol_lag1" in df_clean.columns:
+        median_interact = df_clean["subst_x_vol_lag1"].median()
+        high_crim = df_clean[df_clean["subst_x_vol_lag1"] > median_interact]
+        low_crim = df_clean[df_clean["subst_x_vol_lag1"] <= median_interact]
+
+        if len(high_crim) > 10 and len(low_crim) > 10:
+            corr_high = high_crim["btc_return"].corr(high_crim["btc_return_lead1"])
+            corr_low = low_crim["btc_return"].corr(low_crim["btc_return_lead1"])
+
+            results["split_sample"] = {
+                "high_crim_persistence": float(corr_high),
+                "low_crim_persistence": float(corr_low),
+                "interpretation": (
+                    "More reversal in high-criminal months" if corr_high < corr_low
+                    else "No difference in persistence patterns"
+                ),
+            }
+
+    return results
+
+
 def _save_results(results: Dict[str, Any], df: pd.DataFrame, output_dir: Path) -> None:
     """Save analysis results and data."""
     import json
@@ -780,6 +1489,80 @@ def _generate_report(results: Dict[str, Any]) -> str:
             trend = ra["ratio_trend"]
             lines.append(f"  Monthly change: {trend.get('monthly_pct_change', 0):.2f}%")
             lines.append(f"  Declining: {trend.get('is_declining', False)}")
+        lines.append("")
+
+    # Extended lag analysis (reversal test)
+    if "extended_lags" in results:
+        el = results["extended_lags"]
+        lines.append("EXTENDED LAG ANALYSIS (Reversal Test)")
+        lines.append("-" * 40)
+        if "lag_coefficients" in el:
+            lines.append("  Lag | Interaction Coef | p-value")
+            lines.append("  " + "-" * 35)
+            for lag_data in el["lag_coefficients"]:
+                sig = "***" if lag_data.get("interaction_pvalue", 1) < 0.01 else "**" if lag_data.get("interaction_pvalue", 1) < 0.05 else "*" if lag_data.get("interaction_pvalue", 1) < 0.1 else ""
+                lines.append(f"    {lag_data['lag']} |     {lag_data.get('interaction_coef', 0):+.4f}     | {lag_data.get('interaction_pvalue', 1):.4f} {sig}")
+        if "reversal_test" in el:
+            rt = el["reversal_test"]
+            lines.append(f"\n  Early lags (1-2) avg: {rt.get('avg_early_lag_coef', 0):+.4f}")
+            lines.append(f"  Late lags (4-6) avg:  {rt.get('avg_late_lag_coef', 0):+.4f}")
+            lines.append(f"  Sign change: {rt.get('sign_change', False)}")
+            lines.append(f"  {rt.get('interpretation', '')}")
+        lines.append("")
+
+    # Reverse causality test
+    if "reverse_causality" in results:
+        rc = results["reverse_causality"]
+        lines.append("REVERSE CAUSALITY (BTC Return -> Future Substitution)")
+        lines.append("-" * 40)
+        for lead_key in ["lead_1", "lead_2", "lead_3"]:
+            if lead_key in rc:
+                lead_data = rc[lead_key]
+                sig = "***" if lead_data.get("btc_return_pvalue", 1) < 0.01 else "**" if lead_data.get("btc_return_pvalue", 1) < 0.05 else "*" if lead_data.get("btc_return_pvalue", 1) < 0.1 else ""
+                lines.append(f"  {lead_key}: BTC→Subst coef={lead_data.get('btc_return_coef', 0):+.4f} (p={lead_data.get('btc_return_pvalue', 1):.4f}) {sig}")
+        if "granger_btc_to_subst" in rc:
+            lines.append("\n  Granger Causality (BTC -> Subst):")
+            for lag, gc in rc["granger_btc_to_subst"].items():
+                sig = "***" if gc["p_value"] < 0.01 else "**" if gc["p_value"] < 0.05 else "*" if gc["p_value"] < 0.1 else ""
+                lines.append(f"    Lag {lag}: F={gc['f_stat']:.2f}, p={gc['p_value']:.4f} {sig}")
+        lines.append("")
+
+    # Volatility test
+    if "volatility_test" in results:
+        vt = results["volatility_test"]
+        lines.append("VOLATILITY PREDICTION")
+        lines.append("-" * 40)
+        if "volatility_model" in vt:
+            vm = vt["volatility_model"]
+            sig = "***" if vm.get("interaction_pvalue", 1) < 0.01 else "**" if vm.get("interaction_pvalue", 1) < 0.05 else "*" if vm.get("interaction_pvalue", 1) < 0.1 else ""
+            lines.append(f"  (Subst×Vol)_lag1 -> Volatility: coef={vm.get('interaction_coef', 0):+.4f} (p={vm.get('interaction_pvalue', 1):.4f}) {sig}")
+            lines.append(f"  R²: {vm.get('r_squared', 0):.4f}")
+        if "interpretation" in vt:
+            lines.append(f"  {vt['interpretation'].get('narrative', '')}")
+        lines.append("")
+
+    # Return reversal test
+    if "return_reversal" in results:
+        rr = results["return_reversal"]
+        lines.append("RETURN REVERSAL TEST")
+        lines.append("-" * 40)
+        if "baseline_persistence" in rr:
+            bp = rr["baseline_persistence"]
+            sig = "***" if bp.get("pvalue", 1) < 0.01 else "**" if bp.get("pvalue", 1) < 0.05 else "*" if bp.get("pvalue", 1) < 0.1 else ""
+            lines.append(f"  Baseline return persistence: {bp.get('coef', 0):+.4f} (p={bp.get('pvalue', 1):.4f}) {sig}")
+            lines.append(f"    Pattern: {bp.get('interpretation', 'N/A')}")
+        if "reversal_model" in rr:
+            rm = rr["reversal_model"]
+            if "three_way_interaction" in rm:
+                twi = rm["three_way_interaction"]
+                sig = "***" if twi.get("pvalue", 1) < 0.01 else "**" if twi.get("pvalue", 1) < 0.05 else "*" if twi.get("pvalue", 1) < 0.1 else ""
+                lines.append(f"  Return × (Subst×Vol)_lag1: {twi.get('coef', 0):+.4f} (p={twi.get('pvalue', 1):.4f}) {sig}")
+        if "split_sample" in rr:
+            ss = rr["split_sample"]
+            lines.append(f"\n  Split sample persistence:")
+            lines.append(f"    High criminal activity: {ss.get('high_crim_persistence', 0):+.4f}")
+            lines.append(f"    Low criminal activity:  {ss.get('low_crim_persistence', 0):+.4f}")
+            lines.append(f"    {ss.get('interpretation', '')}")
         lines.append("")
 
     lines.append("=" * 80)
